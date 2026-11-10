@@ -59,7 +59,13 @@ async def open_browser_context():
     if is_windows:
         headless = appconfig.cfg("headless", False)  # на винде можно с окном (Edge)
     else:
-        headless = True  # на сервере весь экрана нет — всегда headless
+        force = appconfig.cfg("linux_headless", None)
+        if force is None:
+            # на сервере браузер по умолчанию с окном на виртуальном дисплее (Xvfb),
+            # без дисплея остаётся headless
+            headless = not bool(os.environ.get("DISPLAY"))
+        else:
+            headless = bool(force)
     executable = _browser_executable()
 
     pw = await async_playwright().start()
