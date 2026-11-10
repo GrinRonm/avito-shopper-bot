@@ -1,3 +1,4 @@
 aiogram>=3.13
-playwright>=1.48
+# 1.53+ таргетирует только Ubuntu 22.04+ (на 20.04 chromium не поддержан)
+playwright>=1.48,<1.53
 aiohttp>=3.9
