@@ -31,20 +31,11 @@ def pop_throttled() -> bool:
 
 def _browser_executable():
     """Windows -> Edge (человек видит окно, антибот дружелюбнее).
-    Linux/сервер -> Chromium Playwright из кэша (~/.cache/ms-playwright),
-    т.к. patchright не умеет ставить собственную сборку на Ubuntu 20.04."""
+    Linux/сервер -> ничего: patchright/playwright сами находят родную сборку
+    (patchright качает свою патченную chromium в ~/.cache/ms-playwright)."""
     path = appconfig.cfg("edge_path", "")
     if path and platform.system() == "Windows" and os.path.exists(path):
         return path
-    if platform.system() != "Windows":
-        import glob
-        for pat in (
-            os.path.expanduser("~/.cache/ms-playwright/chromium-*/chrome-linux/chrome"),
-            os.path.expanduser("~/.cache/ms-playwright/chromium_headless_shell-*/chrome-linux/headless_shell"),
-        ):
-            candidates = sorted(glob.glob(pat), reverse=True)
-            if candidates:
-                return candidates[0]
     return None
 
 
