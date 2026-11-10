@@ -222,7 +222,21 @@ async def api_items(request):
     mode = request.query.get("mode", "all")
     search_id = request.query.get("search_id")
     search_id = int(search_id) if search_id and search_id.isdigit() else None
-    return _json(db.list_items_web(mode, chat_id=request["chat_id"], search_id=search_id))
+    q = (request.query.get("q") or "").strip()
+    return _json(db.list_items_web(mode, chat_id=request["chat_id"], search_id=search_id, q=q))
+
+
+@require_auth
+async def api_item_card(request):
+    """Полная карточка лота: с кэшем карточки Авито (описание, характеристики, фото)."""
+    sid = int(request.match_info["sid"])
+    if not db.get_search_for_user(sid, request["chat_id"]):
+        return _json({"error": "not found"}, status=404)
+    item = db.get_item_full(sid, request.match_info["iid"])
+    if not item:
+        return _json({"error": "not found"}, status=404)
+    card = db.get_item_card(sid, request.match_info["iid"])
+    return _json({"item": item, "card": card})
 
 
 @require_auth
@@ -246,23 +260,41 @@ async def _do_compare(chat_id: int, rows: list, note: str):
         import avito
         import ai as ai_client
         cards = []
-        pw, browser, page = await avito.open_browser_context()
-        try:
-            for r in rows:
-                info = await avito.inspect_item(page, r["url"])
-                if info.get("is_reserved"):
-                    info = {"description": "", "params": [], "defect": None}
-                elif info.get("defect"):
-                    d = info["defect"]
-                    info = {"description": f"(Возможный дефект: {d})", "params": [], "defect": d}
+        # сначала берём карточки из кэша; заходим на Авито только к тем, которых нет
+        missing = []
+        for r in rows:
+            cached = db.get_item_card(r["search_id"], r["avito_id"])
+            if cached is not None:
                 cards.append({
                     "title": r["title"],
                     "price": r["price"],
-                    "params": info.get("params") or [],
-                    "description": info.get("description") or r["snippet"] or "",
+                    "params": cached.get("params") or [],
+                    "description": cached.get("description") or r["snippet"] or "",
                 })
-        finally:
-            await avito.close_browser_context(pw, browser)
+            else:
+                missing.append(r)
+
+        if missing:
+            pw, browser, page = await avito.open_browser_context()
+            try:
+                for r in missing:
+                    info = await avito.inspect_item(page, r["url"])
+                    if info.get("is_reserved"):
+                        info = {"description": "", "params": [], "photos": []}
+                    elif info.get("defect"):
+                        d = info["defect"]
+                        info = {"description": f"(Возможный дефект: {d})", "params": [], "photos": []}
+                    # сохраняем в кэш, чтобы в следующий раз и другим вайм
+                    db.save_item_card(r["search_id"], r["avito_id"], info)
+                    cards.append({
+                        "title": r["title"],
+                        "price": r["price"],
+                        "params": info.get("params") or [],
+                        "description": info.get("description") or r["snippet"] or "",
+                    })
+            finally:
+                await avito.close_browser_context(pw, browser)
+
         verdict = await ai_client.compare_items(cards, note)
         if not verdict:
             state.update(state="error", error="Нейросеть не вернула ответ — попробуй ещё раз чуть позже")
@@ -380,6 +412,9 @@ section h3{margin:2px 0 0;font-size:16px;font-weight:800}
 .chip.on{background:var(--accent);border-color:var(--accent);color:#05231a;font-weight:750}
 
 /* ---------- item card ---------- */
+.item-card{position:relative}
+.acts{position:absolute;top:12px;right:12px;display:flex;gap:6px;flex-shrink:0;z-index:2}
+.act-under{position:absolute;top:12px;right:106px;font-size:11px;color:var(--muted);z-index:1}
 .pricing{font-weight:800;font-size:18px;color:var(--accent);letter-spacing:.2px}
 .badge{display:inline-block;padding:2.5px 9px;border-radius:10px;font-size:10.5px;font-weight:750;color:#0a0d12;vertical-align:1px}
 .b-match{background:var(--warn)}/* совпадение */ .b-match{background:#a9f0cd}
@@ -397,6 +432,41 @@ section h3{margin:2px 0 0;font-size:16px;font-weight:800}
 .it-btn.danger:hover{border-color:var(--bad)}
 a.lnk{color:var(--accent2);text-decoration:none;font-size:12.5px;font-weight:650}
 .hidden-item{opacity:.45;filter:saturate(.4)}
+
+.this-card{background:var(--panel2);border:1px solid var(--line);border-radius:14px;margin:10px 0}
+.act-btn{flex:1;display:flex;align-items:center;justify-content:center;gap:6px;border:1px solid var(--line);background:var(--panel3);color:var(--text);border-radius:10px;padding:9px 12px;cursor:pointer;font-size:13px;font-weight:700;transition:.13s;text-align:center}
+.act-btn:hover{border-color:var(--line2)}
+.act-btn.violet{background:linear-gradient(135deg,rgba(167,139,250,.25),rgba(124,92,255,.12));border-color:var(--violet)}
+.act-btn.warn{background:linear-gradient(135deg,rgba(251,191,36,.22),rgba(251,191,36,.08));border-color:var(--warn)}
+.act-btn.danger:hover{border-color:var(--bad);color:var(--bad)}
+
+/* ---------- поиск и фильтры ---------- */
+.searchbox{display:flex;gap:8px;align-items:center;margin:2px 0 6px}
+.searchbox input{flex:1;border-radius:22px;padding:10px 15px;font-size:14px}
+.searchbox .fb{flex:0 0 auto;border:1px solid var(--line);background:var(--panel2);color:var(--text);border-radius:22px;padding:10px 13px;font-size:13px;cursor:pointer;white-space:nowrap}
+.searchbox .fb.has{border-color:var(--violet);color:var(--violet)}
+
+/* ---------- модалки ---------- */
+.modal{position:fixed;inset:0;z-index:60;background:rgba(4,7,12,.72);backdrop-filter:blur(3px);display:none;align-items:flex-end;justify-content:center}
+.modal.open{display:flex}
+.sheet{background:var(--panel);border:1px solid var(--line);border-radius:18px 18px 0 0;width:100%;max-height:88vh;overflow-y:auto;padding:14px 15px calc(env(safe-area-inset-bottom) + 14px)}
+.sheet.grab{width:42px;height:4px;border-radius:3px;background:var(--line2);margin:-4px auto 10px}
+.modal .sheet h3{display:flex;align-items:center;gap:8px}
+.sheet .x{position:sticky;top:0;float:right;width:32px;height:32px;border-radius:50%;background:var(--panel3);border:1px solid var(--line);color:var(--muted);cursor:pointer;z-index:2}
+@media(min-width:700px){
+  .modal{align-items:center}
+  .sheet{max-width:640px;border-radius:18px}
+}
+
+/* карточка товара в модалке */
+.gal{display:flex;gap:8px;overflow-x:auto;scroll-snap-type:x mandatory;scrollbar-width:none;margin:10px 0 4px;padding-bottom:2px}
+.gal::-webkit-scrollbar{display:none}
+.gal img{height:150px;flex:0 0 auto;border-radius:12px;scroll-snap-align:center;border:1px solid var(--line);object-fit:cover;background:var(--panel3)}
+.param-list{margin:8px 0 0;padding:0;list-style:none}
+.param-list li{padding:5px 0;border-bottom:1px solid var(--line);font-size:13px;color:#cbd5e1}
+.param-list li:last-child{border:none}
+.desc{white-space:pre-wrap;font-size:13.5px;line-height:1.65;color:#dbe3ec;margin-top:6px}
+.big-price{font-size:22px;font-weight:800;color:var(--accent)}
 
 /* ---------- пустые / загрузка ---------- */
 .ghosting{text-align:center;color:var(--muted);padding:50px 16px;font-size:14.5px;line-height:1.6}
@@ -486,7 +556,11 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
       <button class="chip" onclick="setMode(this,'rejected')">Отброшенные</button>
       <button class="chip" onclick="setMode(this,'all')">Все</button>
     </div>
-    <div class="chips" id="search-chips" style="margin-top:-4px"><button class="chip on" onclick="setSearchFilter(this,null)">Все поиски</button></div>
+    <div class="searchbox">
+      <input id="q-search" placeholder="🔎 Поиск по лотам (название, описание…)" oninput="onSearchInput()">
+      <button class="fb" id="fb-btn" onclick="openFilterModal()">🎛 Поиски</button>
+    </div>
+    <div class="muted" id="q-hint" style="display:none;margin:0 4px 6px"></div>
     <div id="items-list"></div>
   </div>
 
@@ -519,13 +593,21 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
   </div>
 </div>
 
-<div class="toast" id="toast"></div>
+<div id="toast" class="toast"></div>
+
+<div class="modal" id="modal" onclick="modalBg(event)">
+  <div class="sheet">
+    <div class="grab"></div>
+    <div id="modal-body"></div>
+  </div>
+</div>
 
 <script>
 const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
 if (tg) { tg.ready(); tg.expand(); }
 
-let state = { tab:'items', mode:'notified', searchFilter:null, sid:null, searches:[], pollItems:null, pollNew:null, cmp:[], curQ:null };
+// ---------------- поиск и фильтры лотов ----------------
+let state = { tab:'items', mode:'notified', searchFilter:null, sid:null, searches:[], pollItems:null, pollNew:null, cmp:[], curQ:null, q:'', qTimer:null };
 
 function esc(s){ return (s??'').toString().replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;'); }
 function rub(v){ return v ? Number(v).toLocaleString('ru-RU')+' ₽' : '—'; }
@@ -593,23 +675,56 @@ async function startApp(){
   setTab('items');
 }
 
-// ---------------- чипсы: фильтры по поискам ----------------
+// ---------------- чипсы: фильтры по поискам (в модалке) ----------------
 async function loadChips(){
   state.searches = await api('/api/searches');
-  const chips = document.getElementById('search-chips');
-  chips.innerHTML = '';
-  const all = document.createElement('button');
-  all.className = 'chip'+(state.searchFilter===null?' on':'');
-  all.textContent = 'Все поиски';
-  all.onclick = ()=>setSearchFilter(all, null);
-  chips.appendChild(all);
-  state.searches.filter(s=>s.items_count > 0).forEach(s=>{
-    const b = document.createElement('button');
-    b.className = 'chip'+(state.searchFilter===s.id?' on':'');
-    b.textContent = `#${s.id} ${esc(s.title).slice(0,26)}`;
-    b.onclick = ()=>setSearchFilter(b, s.id);
-    chips.appendChild(b);
-  });
+  const active = state.searches.filter(s=>s.items_count > 0);
+  document.getElementById('fb-btn').classList.toggle('has', !!state.searchFilter);
+  updQHint(active);
+}
+function updQHint(active){
+  // полоска-подсказка под поиском: какой фильтр включён
+  const hint = document.getElementById('q-hint');
+  const f = (state.searches||[]).find(s=>s.id===state.searchFilter);
+  if (state.searchFilter && f){
+    hint.style.display = 'block';
+    hint.innerHTML = `Только «${esc(f.title)}» · <a href="#" onclick="resetFilter(event)">сбросить</a>`;
+  } else {
+    hint.style.display = 'none';
+  }
+}
+function resetFilter(ev){
+  if (ev) ev.preventDefault();
+  state.searchFilter = null;
+  document.getElementById('fb-btn').classList.remove('has');
+  updQHint(); loadItems();
+}
+function onSearchInput(){
+  clearTimeout(state.qTimer);
+  state.qTimer = setTimeout(()=>{
+    const was = state.q;
+    state.q = document.getElementById('q-search').value.trim();
+    if (was !== state.q) loadItems();
+  }, 350);
+}
+function openFilterModal(){
+  const opts = (state.searches||[]).map(s=>`
+    <button class="act-btn ${state.searchFilter===s.id?'violet':''}" style="margin:5px 0;width:100%;justify-content:flex-start" onclick="pickSearch(${s.id})">
+      №${s.id} ${esc(s.title).slice(0,34)} <span class="muted">· ${s.items_count} лотов</span>
+    </button>`).join('') || '<div class="muted">Поисков ещё нет</div>';
+  showModal(`
+    <h3>🎛 Фильтр по поиску</h3>
+    <p class="muted" style="margin:6px 0">Показать лоты, найденные одним поиском — или всё сразу.</p>
+    <button class="act-btn ${state.searchFilter===null?'violet':''}" style="width:100%;justify-content:flex-start" onclick="pickSearch(null)">🌐 Все поиски</button>
+    ${opts}
+  `);
+}
+function pickSearch(sid){
+  state.searchFilter = sid;
+  document.getElementById('fb-btn').classList.toggle('has', !!sid);
+  closeModal();
+  updQHint();
+  loadItems();
 }
 function setMode(el, m){
   state.mode = m;
@@ -619,9 +734,57 @@ function setMode(el, m){
 }
 function setSearchFilter(el, sid){
   state.searchFilter = sid;
-  document.querySelectorAll('#search-chips .chip').forEach(c=>c.classList.remove('on'));
-  el.classList.add('on');
+  if (el) {
+    document.querySelectorAll('#search-chips .chip').forEach(c=>c.classList.remove('on'));
+    el.classList.add('on');
+  }
   loadItems();
+}
+
+// ---------------- модалки ----------------
+function showModal(html){
+  const m = document.getElementById('modal');
+  document.getElementById('modal-body').innerHTML = html;
+  m.classList.add('open');
+}
+function closeModal(){ document.getElementById('modal').classList.remove('open'); }
+function modalBg(ev){ if (ev.target === ev.currentTarget) closeModal(); }
+
+// ---------------- карточка товара ----------------
+async function openItem(sid, iid){
+  let data;
+  try { data = await api(`/api/items/${sid}/${iid}`); } catch(e){ return; }
+  const it = data.item || {};
+  const card = data.card;
+  const params = (card && card.params || []).map(p=>`<li>${esc(p)}</li>`).join('');
+  const photos = ((card && card.photos) || []).map(u=>`<img src="${esc(u)}" loading="lazy" onclick="event.stopPropagation()" alt="фото">`).join('');
+  showModal(`
+    <div class="x" onclick="closeModal()">✕</div>
+    <h3>${esc(it.title||'').slice(0,70)}</h3>
+    <div style="margin:6px 0 2px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <span class="big-price">${rub(it.price)}</span> ${verBadge(it)}
+    </div>
+    <div class="muted">${esc(it.created_at||'')} · поиск «${esc(it.search_title||'')}»${card&&card.fetched_at?' · карточка снята: '+esc(card.fetched_at):''}</div>
+    ${photos ? `<div class="gal">${photos}</div>` : ''}
+    ${card && card.description ? `<div style="margin:10px 0 0;font-size:12px;color:var(--muted)">Описание продавца</div><div class="desc">${esc(card.description)}</div>` : ''}
+    ${params ? `<div style="margin:12px 0 0;font-size:12px;color:var(--muted)">Характеристики</div><ul class="param-list">${params}</ul>` : ''}
+    ${!card ? '<div class="ghosting"><b>🕐</b>Карточка ещё не снималась.<br>Вся информация появится, когда бот зайдёт на эту карточку при сканировании (или при сравнении).</div>' : ''}
+    <div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap">
+      <button class="act-btn warn" onclick="closeModal();toggleItemFlagFromModal('${sid}','${esc(iid)}','favorite');">⭐ В избранное</button>
+      <button class="act-btn violet" onclick="toggleFromModal('${sid}','${esc(iid)}')">⚖️ В сравнение</button>
+      <button class="act-btn danger" onclick="closeModal();toggleItemFlagFromModal('${sid}','${esc(iid)}','hidden');">👁 ${it.hidden?'Вернуть':'Скрыть'}</button>
+      <a class="act-btn" href="${esc(it.url||'#')}" target="_blank" rel="noopener" style="text-decoration:none">↗ На Авито</a>
+    </div>
+  `);
+}
+async function toggleItemFlagFromModal(sid, iid, field){
+  await api(`/api/items/${sid}/${iid}/flag/${field}`, {});
+  loadItems();
+}
+function toggleFromModal(sid, iid){
+  toggleCmp(sid, iid);
+  loadItems();
+  if (state.tab !== 'cmp') toast('⚖️ Добавил в сравнение — вкладка «Сравнение»');
 }
 
 // ---------------- лоты ----------------
@@ -639,6 +802,7 @@ async function loadItems(){
   const box = document.getElementById('items-list');
   const q = new URLSearchParams({mode: state.mode});
   if (state.searchFilter) q.set('search_id', state.searchFilter);
+  if (state.q) q.set('q', state.q);
   let items;
   try { items = await api('/api/items?'+q); } catch(e){ return; }
   state.itemsCache = items;
@@ -649,21 +813,17 @@ async function loadItems(){
   }
   box.innerHTML = items.map(i=>{
     const inCmp = cmpOn(i);
-    return `<div class="card ${i.hidden?'hidden-item':''}">
-      <div class="row">
-        <div class="grow">
-          <div style="font-size:14.5px;font-weight:750;line-height:1.35">${esc(i.title)}</div>
-          <div style="margin:5px 0 2px"><span class="pricing">${rub(i.price)}</span> ${verBadge(i)} ${i.favorite?'⭐':''} ${i.hidden?' 👻':''}</div>
-          <div class="muted" style="margin:4px 0 2px">${esc((i.reason||i.snippet||'').slice(0,220))}</div>
-          <div class="muted">${esc(i.created_at||'')} · поиск «${esc(i.search_title)}»</div>
-          <a class="lnk" href="${esc(i.url)}" target="_blank" rel="noopener">Открыть на Авито ↗</a>
-        </div>
-        <div class="acts">
-          <button class="it-btn ${i.favorite?'on':''}" onclick="toggleFlag('${i.search_id}','${esc(i.avito_id)}','favorite')" title="В избранное">⭐</button>
-          <button class="it-btn cmp ${inCmp?'on':''}" onclick="toggleCmp('${i.search_id}','${esc(i.avito_id)}',this)" title="В сравнение">⚖️</button>
-          <button class="it-btn ${i.hidden?'on':'danger'}" onclick="toggleFlag('${i.search_id}','${esc(i.avito_id)}','hidden')" title="Скрыть/вернуть">👁</button>
-        </div>
+    return `<div class="card item-card ${i.hidden?'hidden-item':''}" onclick="openItem(${i.search_id},'${esc(i.avito_id)}')">
+      <div class="acts">
+        <button class="it-btn ${i.favorite?'on':''}" onclick="event.stopPropagation();toggleFlag('${i.search_id}','${esc(i.avito_id)}','favorite')" title="В избранное">⭐</button>
+        <button class="it-btn cmp ${inCmp?'on':''}" onclick="event.stopPropagation();toggleCmp('${i.search_id}','${esc(i.avito_id)}',this)" title="В сравнение">⚖️</button>
+        <button class="it-btn ${i.hidden?'on':'danger'}" onclick="event.stopPropagation();toggleFlag('${i.search_id}','${esc(i.avito_id)}','hidden')" title="Скрыть/вернуть">👁</button>
       </div>
+      <div style="font-size:14.5px;font-weight:750;line-height:1.35">${esc(i.title)}</div>
+      <div style="margin:5px 0 2px;display:flex;align-items:center;gap:8px;flex-wrap:wrap"><span class="pricing">${rub(i.price)}</span> ${verBadge(i)} ${i.favorite?'⭐':''} ${i.hidden?' 👻':''}</div>
+      <div class="muted" style="margin:4px 0 2px">${esc((i.reason||i.snippet||'').slice(0,220))}</div>
+      <div class="muted">${esc(i.created_at||'')} · поиск «${esc(i.search_title)}»</div>
+      <a class="lnk" href="${esc(i.url)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">Открыть на Авито ↗</a>
     </div>`;
   }).join('');
 }
@@ -928,6 +1088,7 @@ def build_app() -> web.Application:
     app.router.add_post("/api/auth/code", auth_code)
     app.router.add_get("/api/me", me)
     app.router.add_get("/api/items", api_items)
+    app.router.add_get("/api/items/{sid}/{iid}", api_item_card)
     app.router.add_post("/api/items/{sid}/{iid}/flag/{field}", api_flag)
     app.router.add_get("/api/searches", api_searches)
     app.router.add_get("/api/search/{sid}", api_search_get)

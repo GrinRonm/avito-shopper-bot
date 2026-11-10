@@ -191,9 +191,9 @@ async def scan_listing(page, search: dict) -> list:
 
 
 async def inspect_item(page, url: str = None):
-    """Заходит в карточку: полное описание, характеристики, резерв.
+    """Заходит в карточку: полное описание, характеристики, фото, резерв.
     Ждёт отрисовку характеристик (два блока с data-marker="item-view/item-params")."""
-    out = {"is_reserved": False, "description": "", "params": [], "defect": None}
+    out = {"is_reserved": False, "description": "", "params": [], "photos": [], "fetched_at": "", "defect": None}
 
     for attempt in (1, 2):
         try:
@@ -224,7 +224,18 @@ async def inspect_item(page, url: str = None):
                 if txt and "\n" not in txt[:30]:
                     out["params"].append(txt.replace("\n", " ").strip())
 
+            # фото из галереи: только крупные картинки Авито (не лого/бейджи/шрифты)
+            srcs = await page.evaluate(
+                """() => Array.from(document.querySelectorAll('img'))
+                    .filter(i => i.src.includes('img.avito.st/image/')
+                                 && (i.naturalWidth >= 250 || !i.complete))
+                    .slice(0, 6).map(i => i.src)"""
+            )
+            out["photos"] = list(dict.fromkeys(srcs))
+
             if out["description"] or out["params"]:
+                from datetime import datetime
+                out["fetched_at"] = datetime.now().isoformat(timespec="seconds")
                 break
             if attempt == 1:
                 # пусто — возможно страница дорисовывалась, пробуем ещё раз

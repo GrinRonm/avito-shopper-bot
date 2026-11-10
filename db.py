@@ -79,6 +79,8 @@ def init_db():
     for col in ("favorite", "hidden"):
         if col not in cols:
             conn.execute(f"ALTER TABLE items ADD COLUMN {col} INTEGER DEFAULT 0")
+    if "card_json" not in cols:
+        conn.execute("ALTER TABLE items ADD COLUMN card_json TEXT DEFAULT ''")
     conn.commit()
     conn.close()
 
@@ -234,6 +236,18 @@ def get_notification(message_id: int) -> dict | None:
     return dict(row) if row else None
 
 
+def hide_item_forever(search_id: int, avito_id: str, reason: str = ""):
+    """Лот, отклонённый реплаем, больше не показывается и не предлагается."""
+    conn = _conn()
+    conn.execute(
+        "UPDATE items SET hidden = 1, status = 'REJECTED_FEEDBACK', reason = ? "
+        "WHERE search_id = ? AND avito_id = ?",
+        (reason, search_id, str(avito_id)),
+    )
+    conn.commit()
+    conn.close()
+
+
 # ---------- флаги лотов / удаление поиска (для сайта) ----------
 
 def toggle_item_flag(sid: int, avito_id: str, field: str) -> int | None:
@@ -352,8 +366,8 @@ FROM items i JOIN searches s ON s.id = i.search_id
 """
 
 
-def list_items_web(mode: str = "all", chat_id: int = None, search_id: int = None) -> list:
-    """mode: all | notified | favorites | hidden | rejected"""
+def list_items_web(mode: str = "all", chat_id: int = None, search_id: int = None, q: str = "") -> list:
+    """mode: all | notified | favorites | hidden | rejected; q — поиск по названию/описанию."""
     base = WEB_ITEM_SELECT
     conds, vals = [], []
     if chat_id is not None:
@@ -362,6 +376,7 @@ def list_items_web(mode: str = "all", chat_id: int = None, search_id: int = None
     if search_id is not None:
         conds.append("i.search_id = ?")
         vals.append(search_id)
+    # поиск по лотам — в Python: LIKE в SQLite не приводит к нижнему регистру кириллицу
     if mode == "notified":
         conds.append("i.notified = 1 AND i.hidden = 0")
     elif mode == "favorites":
@@ -376,7 +391,14 @@ def list_items_web(mode: str = "all", chat_id: int = None, search_id: int = None
     conn = _conn()
     rows = conn.execute(f"{base}{where} ORDER BY i.created_at DESC LIMIT 300", vals).fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    out = [dict(r) for r in rows]
+    if q:
+        needle = q.strip().casefold()
+        out = [
+            r for r in out
+            if needle in f'{r["title"]}\n{r.get("snippet") or ""}\n{r.get("reason") or ""}\n{r.get("search_title") or ""}'.casefold()
+        ]
+    return out
 
 
 def list_searches_web(chat_id: int = None) -> list:
@@ -420,6 +442,33 @@ def get_item_full(sid: int, avito_id: str) -> dict | None:
     ).fetchone()
     conn.close()
     return dict(row) if row else None
+
+
+def save_item_card(sid: int, avito_id: str, info: dict):
+    """Кэш карточки Авито: описание, характеристики, фото."""
+    conn = _conn()
+    conn.execute(
+        "UPDATE items SET card_json = ? WHERE search_id = ? AND avito_id = ?",
+        (json.dumps(info, ensure_ascii=False), sid, str(avito_id)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_item_card(sid: int, avito_id: str) -> dict | None:
+    """Распакованный кэш карточки (или None, если ещё не снята)."""
+    conn = _conn()
+    row = conn.execute(
+        "SELECT card_json FROM items WHERE search_id = ? AND avito_id = ?",
+        (sid, str(avito_id)),
+    ).fetchone()
+    conn.close()
+    if not row or not row["card_json"]:
+        return None
+    try:
+        return json.loads(row["card_json"])
+    except Exception:
+        return None
 
 
 # ---------- коды входа на сайт ----------

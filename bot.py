@@ -534,6 +534,10 @@ async def handle_feedback(message: Message, notif: dict, text: str):
         await thinking.edit_text("😵 Не разобрал ответ. Напиши чуть подробнее, почему не подходит.")
         return
 
+    # лот, отклонённый реплаем, прячем навсегда: он не зайдёт на сайт и не всплывёт снова
+    db.hide_item_forever(notif["search_id"], notif["avito_id"],
+                         reason=f"Отклонён реплаем: {(text or '—')[:120]}")
+
     profile = search["profile"]
     profile.setdefault("must", []).extend(upd.get("add_must", []))
     profile.setdefault("must_not", []).extend(upd.get("add_must_not", []))
@@ -632,6 +636,8 @@ async def run_scan(bot: Bot):
                     log.info(f"   [нет данных] {it['title'][:40]} -> карточка не открылась с данными")
                     continue
                 inspected[(s["id"], it["item_id"])] = {"search": s, "item": it, "card": info}
+                # кэшируем карточку целиком (описание, характеристики, фото)
+                db.save_item_card(s["id"], it["item_id"], info)
                 i += 1
         finally:
             await avito.close_browser_context(pw, browser)
