@@ -236,7 +236,66 @@ async def api_item_card(request):
     if not item:
         return _json({"error": "not found"}, status=404)
     card = db.get_item_card(sid, request.match_info["iid"])
-    return _json({"item": item, "card": card})
+    pos = db.queue_position(sid, request.match_info["iid"])
+    return _json({"item": item, "card": card, "queue_position": pos})
+
+
+@require_auth
+async def api_item_card_request(request):
+    """Поставить карточку лота в очередь на снятие ботом."""
+    sid = int(request.match_info["sid"])
+    iid = request.match_info["iid"]
+    s = db.get_search_for_user(sid, request["chat_id"])
+    if not s:
+        return _json({"ok": False, "error": "not found"}, status=404)
+    state = db.queue_card_request(sid, iid, request["chat_id"])
+    if state == "has_card":
+        return _json({"ok": True, "state": "has_card"})
+    return _json({"ok": True, "state": state, "position": db.queue_position(sid, iid)})
+
+
+# ---------- воркер очереди карточек ----------
+
+async def _card_worker():
+    """Фон: снимает карточки из очереди (Аккуратно к IP — между заходами пауза)."""
+    cooldown = int(appconfig.cfg("card_fetch_cooldown_seconds", 180))
+    while True:
+        try:
+            batch = db.pop_card_requests(1)
+        except Exception:
+            log.exception("card queue read failed")
+            batch = []
+        if not batch:
+            await asyncio.sleep(15)
+            continue
+        r = batch[0]
+        sid, iid, url = r["search_id"], r["avito_id"], r["url"]
+        log.info("🃏 Воркер: снимаю карточку %s (поиск %s)", iid, sid)
+        db.set_card_request_status(sid, iid, "PROCESSING")
+        try:
+            import avito
+            pw, browser, page = await asyncio.wait_for(avito.open_browser_context(), timeout=40)
+            try:
+                info = await asyncio.wait_for(avito.inspect_item(page, url), timeout=150)
+            finally:
+                try:
+                    await asyncio.wait_for(avito.close_browser_context(pw, browser), timeout=20)
+                except Exception:
+                    log.exception("воркер: браузер не закрылся чисто")
+            if info.get("description") or info.get("params") or info.get("photos"):
+                db.save_item_card(sid, iid, info)
+                db.set_card_request_status(sid, iid, "DONE")
+                log.info("🃏 карточка %s снята (%s фото)", iid, len(info.get("photos") or []))
+            else:
+                # Авито, скорее всего, показал заглушку — вернём в очередь
+                db.set_card_request_status(sid, iid, "QUEUED")
+                log.info("🃏 карточка %s не открылась — вернул в очередь", iid)
+                await asyncio.sleep(max(cooldown * 2, 300))
+                continue
+        except Exception:
+            log.exception("card worker failed for %s", iid)
+            db.set_card_request_status(sid, iid, "QUEUED")
+        await asyncio.sleep(cooldown)
 
 
 @require_auth
@@ -759,6 +818,7 @@ async function openItem(sid, iid){
   try { data = await api(`/api/items/${sid}/${iid}`); } catch(e){ return; }
   const it = data.item || {};
   const card = data.card;
+  const pos = data.queue_position || 0;
   const params = (card && card.params || []).map(p=>`<li>${esc(p)}</li>`).join('');
   const photos = ((card && card.photos) || []).map(u=>`<img src="${esc(u)}" loading="lazy" onclick="event.stopPropagation()" alt="фото">`).join('');
   showModal(`
@@ -771,7 +831,12 @@ async function openItem(sid, iid){
     ${photos ? `<div class="gal">${photos}</div>` : ''}
     ${card && card.description ? `<div style="margin:10px 0 0;font-size:12px;color:var(--muted)">Описание продавца</div><div class="desc">${esc(card.description)}</div>` : ''}
     ${params ? `<div style="margin:12px 0 0;font-size:12px;color:var(--muted)">Характеристики</div><ul class="param-list">${params}</ul>` : ''}
-    ${!card ? '<div class="ghosting"><b>🕐</b>Карточка ещё не снималась.<br>Вся информация появится, когда бот зайдёт на эту карточку при сканировании (или при сравнении).</div>' : ''}
+    ${!card ? `<div class="ghosting"><b>🕐</b>${pos
+      ? '⏳ Запрошено — в очереди на снятие, позиция ' + pos + '.<br>Карточка появится, когда бот зайдёт на лот.'
+      : 'Карточка ещё не снималась. Запроси — бот зайдёт на лот с Авито и достанет фото, описание и характеристики.'}</div>
+    <div style="display:flex;justify-content:center;margin-top:8px">
+      <button class="act-btn violet" onclick="requestCard('${sid}','${esc(iid)}')">🔎 Запросить</button>
+    </div>` : ''}
     <div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap">
       <button class="act-btn warn" onclick="closeModal();toggleItemFlagFromModal('${sid}','${esc(iid)}','favorite');">⭐ В избранное</button>
       <button class="act-btn violet" onclick="toggleFromModal('${sid}','${esc(iid)}')">⚖️ В сравнение</button>
@@ -783,6 +848,18 @@ async function openItem(sid, iid){
 async function toggleItemFlagFromModal(sid, iid, field){
   await api(`/api/items/${sid}/${iid}/flag/${field}`, {});
   loadItems();
+}
+async function requestCard(sid, iid){
+  let r;
+  try { r = await api(`/api/items/${sid}/${iid}/request`, {}); } catch(e){ return; }
+  if (r.state === 'has_card') { toast('✅ Карточка уже снята — закрой и открой лота'); }
+  else if (r.state === 'already') { toast('⏳ Уже в очереди — позиция ' + (r.position ?? '?')); }
+  else { toast('✅ Поставил в очередь — позиция ' + (r.position ?? '?')); }
+  clearInterval(state.pollCard);
+  state.pollCard = setInterval(()=>{
+    if (!document.getElementById('modal').classList.contains('open')) { clearInterval(state.pollCard); return; }
+    openItem(sid, iid);
+  }, 10000);
 }
 function toggleFromModal(sid, iid){
   toggleCmp(sid, iid);
@@ -1093,6 +1170,7 @@ def build_app() -> web.Application:
     app.router.add_get("/api/items", api_items)
     app.router.add_get("/api/items/{sid}/{iid}", api_item_card)
     app.router.add_post("/api/items/{sid}/{iid}/flag/{field}", api_flag)
+    app.router.add_post("/api/items/{sid}/{iid}/request", api_item_card_request)
     app.router.add_get("/api/searches", api_searches)
     app.router.add_get("/api/search/{sid}", api_search_get)
     app.router.add_post("/api/search", api_search_create)
@@ -1111,4 +1189,5 @@ async def start_server():
     site = web.TCPSite(runner, host="0.0.0.0", port=port)
     await site.start()
     log.info(f"🌐 mini-app слушает http://0.0.0.0:{port}")
+    asyncio.create_task(_card_worker())
     return runner

@@ -47,6 +47,14 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (search_id, avito_id)
         );
+        CREATE TABLE IF NOT EXISTS card_queue (
+            search_id INTEGER NOT NULL,
+            avito_id TEXT NOT NULL,
+            chat_id INTEGER,
+            status TEXT DEFAULT 'QUEUED',
+            requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (search_id, avito_id)
+        );
         CREATE TABLE IF NOT EXISTS notifications (
             message_id INTEGER PRIMARY KEY,
             search_id INTEGER NOT NULL,
@@ -462,13 +470,83 @@ def get_item_card(sid: int, avito_id: str) -> dict | None:
         "SELECT card_json FROM items WHERE search_id = ? AND avito_id = ?",
         (sid, str(avito_id)),
     ).fetchone()
+    if row and row["card_json"]:
+        conn.close()
+        try:
+            return json.loads(row["card_json"])
+        except Exception:
+            return None
     conn.close()
-    if not row or not row["card_json"]:
-        return None
+    return None
+
+
+# ---------- очередь снятия карточек ----------
+
+def queue_card_request(sid: int, avito_id: str, chat_id: int) -> str:
+    """Поставить карточку в очередь на снятие. Возвращает новое состояние:
+    'has_card' (карточка уже снята) | 'queued' (поставили) | 'already' (уже в очереди)."""
+    conn = _conn()
+    row = conn.execute(
+        "SELECT card_json FROM items WHERE search_id = ? AND avito_id = ?",
+        (sid, str(avito_id)),
+    ).fetchone()
+    if row and row["card_json"]:
+        conn.close()
+        return "has_card"
     try:
-        return json.loads(row["card_json"])
+        conn.execute(
+            "INSERT INTO card_queue (search_id, avito_id, chat_id) VALUES (?, ?, ?)",
+            (sid, str(avito_id), chat_id),
+        )
+        state = "queued"
     except Exception:
-        return None
+        state = "already"
+    conn.commit()
+    conn.close()
+    return state
+
+
+def queue_position(sid: int, avito_id: str) -> int:
+    """Позиция карточки в очереди (1 = следующая), 0 если её там нет."""
+    conn = _conn()
+    row = conn.execute(
+        "SELECT requested_at FROM card_queue WHERE search_id=? AND avito_id=? AND status='QUEUED'",
+        (sid, str(avito_id)),
+    ).fetchone()
+    if not row:
+        conn.close()
+        return 0
+    pos = conn.execute(
+        "SELECT COUNT(*) AS n FROM card_queue "
+        "WHERE status='QUEUED' AND requested_at <= ?",
+        (row["requested_at"],),
+    ).fetchone()["n"]
+    conn.close()
+    return pos
+
+
+def pop_card_requests(limit: int = 5) -> list[dict]:
+    """Взять самые старые QUEUED карточки (без url может не быть — фильтруем)."""
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT q.search_id, q.avito_id, i.url, i.title "
+        "FROM card_queue q JOIN items i ON i.search_id = q.search_id AND i.avito_id = q.avito_id "
+        "WHERE q.status = 'QUEUED' AND i.url != '' "
+        "ORDER BY q.requested_at LIMIT ?",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def set_card_request_status(sid: int, avito_id: str, status: str):
+    conn = _conn()
+    conn.execute(
+        "UPDATE card_queue SET status = ? WHERE search_id = ? AND avito_id = ?",
+        (status, sid, str(avito_id)),
+    )
+    conn.commit()
+    conn.close()
 
 
 # ---------- коды входа на сайт ----------
