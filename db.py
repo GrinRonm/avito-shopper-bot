@@ -68,6 +68,11 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             resolved INTEGER DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS auth_codes (
+            chat_id INTEGER PRIMARY KEY,
+            code TEXT NOT NULL,
+            expires_at TIMESTAMP
+        );
     """)
     # миграция на старой базе: новые колонки items
     cols = [r[1] for r in conn.execute("PRAGMA table_info(items)").fetchall()]
@@ -347,43 +352,46 @@ FROM items i JOIN searches s ON s.id = i.search_id
 """
 
 
-def list_items_web(mode: str = "all") -> list:
+def list_items_web(mode: str = "all", chat_id: int = None, search_id: int = None) -> list:
     """mode: all | notified | favorites | hidden | rejected"""
     base = WEB_ITEM_SELECT
+    conds, vals = [], []
+    if chat_id is not None:
+        conds.append("s.chat_id = ?")
+        vals.append(chat_id)
+    if search_id is not None:
+        conds.append("i.search_id = ?")
+        vals.append(search_id)
     if mode == "notified":
-        where = "WHERE i.notified = 1 AND i.hidden = 0"
+        conds.append("i.notified = 1 AND i.hidden = 0")
     elif mode == "favorites":
-        where = "WHERE i.favorite = 1"
+        conds.append("i.favorite = 1")
     elif mode == "hidden":
-        where = "WHERE i.hidden = 1"
+        conds.append("i.hidden = 1")
     elif mode == "rejected":
-        where = "WHERE i.hidden = 0 AND (i.status LIKE 'REJECTED%' OR i.status LIKE 'SCREENED_NO' OR i.verdict = 'REJECT')"
+        conds.append("i.hidden = 0 AND (i.status LIKE 'REJECTED%' OR i.status = 'SCREENED_NO' OR i.verdict = 'REJECT')")
     else:
-        where = "WHERE i.hidden = 0"
+        conds.append("i.hidden = 0")
+    where = ("WHERE " + " AND ".join(conds)) if conds else ""
     conn = _conn()
-    rows = conn.execute(f"{base}{where} ORDER BY i.created_at DESC LIMIT 300").fetchall()
+    rows = conn.execute(f"{base}{where} ORDER BY i.created_at DESC LIMIT 300", vals).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 
-def get_item_flags(sid: int, avito_id: str) -> dict | None:
+def list_searches_web(chat_id: int = None) -> list:
+    conds, vals = [], []
+    if chat_id is not None:
+        conds.append("s.chat_id = ?")
+        vals.append(chat_id)
+    where = ("WHERE " + " AND ".join(conds)) if conds else ""
     conn = _conn()
-    row = conn.execute(
-        "SELECT favorite, hidden, status, verdict FROM items WHERE search_id = ? AND avito_id = ?",
-        (sid, str(avito_id)),
-    ).fetchone()
-    conn.close()
-    return dict(row) if row else None
-
-
-def list_searches_web() -> list:
-    conn = _conn()
-    rows = conn.execute("""
-        SELECT s.id, s.title, s.status, s.profile, s.created_at, s.last_scan_at,
+    rows = conn.execute(f"""
+        SELECT s.id, s.chat_id, s.title, s.status, s.profile, s.created_at, s.last_scan_at,
                (SELECT COUNT(*) FROM items i WHERE i.search_id = s.id AND i.hidden = 0) AS items_count,
                (SELECT COUNT(*) FROM items i WHERE i.search_id = s.id AND i.notified = 1 AND i.hidden = 0) AS matched_count
-        FROM searches s ORDER BY s.id DESC LIMIT 50
-    """).fetchall()
+        FROM searches s {where} ORDER BY s.id DESC LIMIT 50
+    """, vals).fetchall()
     conn.close()
     out = []
     import json as _json
@@ -395,3 +403,41 @@ def list_searches_web() -> list:
             d["profile"] = {}
         out.append(d)
     return out
+
+
+def get_search_for_user(sid: int, chat_id: int) -> dict | None:
+    s = get_search(sid)
+    if not s or s["chat_id"] != chat_id:
+        return None
+    return s
+
+
+# ---------- коды входа на сайт ----------
+
+def create_auth_code(chat_id: int, ttl_minutes: int = 10) -> str:
+    import random
+    code = f"{random.randint(0, 999999):06d}"
+    conn = _conn()
+    conn.execute("DELETE FROM auth_codes WHERE chat_id = ?", (chat_id,))
+    conn.execute(
+        "INSERT INTO auth_codes (chat_id, code, expires_at) VALUES (?, ?, datetime('now', ?))",
+        (chat_id, code, f"+{ttl_minutes} minutes"),
+    )
+    conn.commit()
+    conn.close()
+    return code
+
+
+def consume_auth_code(code: str) -> int | None:
+    """Проверяет код входа; код одноразовый."""
+    conn = _conn()
+    row = conn.execute(
+        "SELECT chat_id FROM auth_codes WHERE code = ? AND expires_at > datetime('now')",
+        (str(code).strip(),),
+    ).fetchone()
+    chat_id = row["chat_id"] if row else None
+    if chat_id is not None:
+        conn.execute("DELETE FROM auth_codes WHERE code = ?", (str(code).strip(),))
+        conn.commit()
+    conn.close()
+    return chat_id

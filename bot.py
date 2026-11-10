@@ -29,6 +29,7 @@ import appconfig
 import avito
 import categories  # noqa: F401 (используется city_label)
 import db
+import searchflow
 from categories import CATEGORIES
 
 log = logging.getLogger("bot")
@@ -36,6 +37,7 @@ log = logging.getLogger("bot")
 TOKEN = appconfig.cfg("telegram_bot_token")
 OWNERS = set(appconfig.cfg("allowed_chat_ids", []))   # владельцы (подтверждают заявки)
 
+BOT: Bot | None = None               # доступен webapp.py (заявки из мини-аппа)
 _wake = asyncio.Event()          # будим скан-цикл досрочно (новый поиск)
 pending: dict[int, dict] = {}    # chat_id -> {"sid": int, "idx": int}
 
@@ -114,7 +116,7 @@ async def cmd_start(message: Message):
     if not allowed(message.chat.id):
         await request_access(message.bot, message.chat.id, message.from_user)
         return
-    await message.answer(WELCOME, disable_web_page_preview=True)
+    await message.answer(WELCOME, disable_web_page_preview=True, reply_markup=web_kb())
 
 
 @router.message(Command("searches"))
@@ -124,17 +126,58 @@ async def cmd_searches(message: Message):
     await send_searches_list(message.bot, message.chat.id)
 
 
+def web_domain() -> str:
+    return (str(appconfig.cfg("web_domain", "") or "")).strip().rstrip("/")
+
+
+def web_kb() -> InlineKeyboardMarkup | None:
+    domain = web_domain()
+    if not domain.startswith("https://"):
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🌐 Открыть веб-приложение", web_app=_tg_webapp()),
+    ]])
+
+
+def _tg_webapp():
+    from aiogram.types import WebAppInfo
+    return WebAppInfo(url=web_domain())
+
+
+@router.message(Command("link"))
+async def cmd_link(message: Message):
+    if message.chat.type != "private" or not allowed(message.chat.id):
+        return
+    domain = web_domain()
+    if not domain:
+        await message.answer("🌐 Сайт ещё не настроен — уточни у владельца.")
+        return
+    code = db.create_auth_code(message.chat.id)
+    await message.answer(
+        f"🔑 Код для входа на {domain}:\n<code>{code}</code>\n\n"
+        f"Действует 10 минут, одноразовый. Если открыл сайт из кнопки мини-аппа — вход произойдёт автоматически.",
+        disable_web_page_preview=True,
+    )
+
+
 # ============================================================ заявки на доступ
 
 async def request_access(bot: Bot, chat_id: int, user):
     """Незнакомый юзер — заявка владельцам на одобрение."""
     name = (user.first_name or "") + (" " + user.last_name if user.last_name else "")
     username = f"@{user.username}" if user.username else ""
-    is_new = db.upsert_access_request(chat_id, username, name)
     try:
         await bot.send_message(chat_id, "👋 Бот личный — отправил заявку владельцу. Ожидай одобрения.")
     except Exception:
         pass
+    await request_access_now(bot, chat_id, username, name)
+
+
+async def request_access_now(bot: Bot, chat_id: int, username: str, name: str = "", last_name: str = ""):
+    """Заявка владельцам; вызывается и из mini-app (webapp.py)."""
+    if last_name:
+        name = (name + " " + last_name).strip()
+    is_new = db.upsert_access_request(chat_id, username, name)
     if not is_new:
         return
     kb = InlineKeyboardMarkup(inline_keyboard=[[
@@ -203,6 +246,8 @@ async def send_searches_list(bot: Bot, chat_id: int):
             acts = []
         if acts:
             kb_rows.append([InlineKeyboardButton(text=f"{t} #{s['id']}", callback_data=f"mng:{a}:{s['id']}") for t, a in acts])
+    if web_kb():
+        kb_rows = kb_rows + [[InlineKeyboardButton(text="🌐 Веб-приложение (лоты, фильтры)", web_app=_tg_webapp())]]
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows) if kb_rows else None
     await bot.send_message(chat_id, "\n".join(lines), reply_markup=kb, disable_web_page_preview=True)
 
@@ -444,26 +489,36 @@ async def on_text(message: Message):
 
 
 async def handle_new_request(message: Message, text: str):
-    wait_msg = await message.answer("🤔 Делаю план поиска, сек...")
-    plan = await ai_client.plan_request(text, appconfig.cfg("default_city_slugs", ["rossiya"]))
-    if not plan:
-        await wait_msg.edit_text("😵 Не смог разобрать запрос. Попробуй сформулировать иначе.")
+    # нельзя вести два поиска одновременно
+    if searchflow.has_running_dialog(message.chat.id):
+        await message.answer("🚫 Один поиск уже запущен или уточняется — начнём новый после него.")
+        asking = db.list_asking_searches(message.chat.id)
+        if asking:
+            await ask_current_question(message.bot, message.chat.id, asking[0])
         return
 
-    sid = db.create_search(
-        message.chat.id, plan.get("title", "Поиск"), text, plan,
-        [{"id": "cities", "question": "В каких городах ищем?", "options": cities_options(plan)}]
-        + plan.get("clarify", []),
+    sid = db.create_search(message.chat.id, "Формируется…", text, {"raw": text}, [])
+    db.set_search_status(sid, "PLANNING")
+    default_cities = appconfig.cfg("default_city_slugs", ["rossiya"])
+    asyncio.create_task(_plan_and_ask(message.bot, message.chat.id, sid, text, default_cities))
+    await message.answer(
+        f"🧠 Делаю план поиска…\nЗапросы к нейросети встают в очередь (лимит ~63 сек) — это может занять пару минут.",
     )
 
-    must = plan.get("must") or []
-    base = (
-        f"📋 <b>Поиск #{sid} «{esc(plan.get('title', ''))}»</b>\n"
-        f"{profile_text(plan)}\n\n"
-        f"<i>Твой запрос:</i> «{esc(text[:200])}»"
-    )
-    await wait_msg.edit_text(base, disable_web_page_preview=True)
-    await ask_current_question(message.bot, message.chat.id, sid)
+
+async def _plan_and_ask(bot: Bot, chat_id: int, sid: int, text: str, default_cities: list):
+    ok = await searchflow.plan_search(sid, text, default_cities)
+    if ok:
+        await ask_current_question(bot, chat_id, sid)
+    else:
+        pending.pop(chat_id, None)
+        try:
+            await bot.send_message(
+                chat_id,
+                f"😵 Не смог собрать план для «{esc(text[:120])}». Попробуй сформулировать иначе или нажми 🔄 Заново в /searches.",
+            )
+        except Exception:
+            pass
 
 
 async def handle_feedback(message: Message, notif: dict, text: str):
@@ -692,6 +747,7 @@ async def main():
 
     db.init_db()
     bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+    globals()["BOT"] = bot          # webapp.py шлёт заявки через BOT
     dp = Dispatcher()
     dp.include_router(router)
 
