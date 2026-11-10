@@ -20,15 +20,29 @@ _RR: dict[int, int] = {}
 
 def _browser_executable():
     """Windows -> Edge (человек видит окно, антибот дружелюбнее).
-    Linux/сервер -> встроенный Chromium Playwright (headless)."""
+    Linux/сервер -> Chromium Playwright из кэша (~/.cache/ms-playwright),
+    т.к. patchright не умеет ставить собственную сборку на Ubuntu 20.04."""
     path = appconfig.cfg("edge_path", "")
     if path and platform.system() == "Windows" and os.path.exists(path):
         return path
+    if platform.system() != "Windows":
+        import glob
+        for pat in (
+            os.path.expanduser("~/.cache/ms-playwright/chromium-*/chrome-linux/chrome"),
+            os.path.expanduser("~/.cache/ms-playwright/chromium_headless_shell-*/chrome-linux/headless_shell"),
+        ):
+            candidates = sorted(glob.glob(pat), reverse=True)
+            if candidates:
+                return candidates[0]
     return None
 
 
 async def open_browser_context():
-    from playwright.async_api import async_playwright
+    """Patchright (невидимый Playwright) — если установлен, иначе обычный Playwright."""
+    try:
+        from patchright.async_api import async_playwright  # антидетект-патченный
+    except ImportError:
+        from playwright.async_api import async_playwright
 
     is_windows = platform.system() == "Windows"
     if is_windows:
@@ -60,7 +74,23 @@ async def open_browser_context():
         kwargs["proxy"] = proxy
 
     browser = await pw.chromium.launch(**kwargs)
-    context = await browser.new_context(locale="ru-RU")
+    # реалистичный десктопный фингерпринт: UA настоящего Chrome в Windows,
+    # вместо палевного headless-агента (по нему Авито режет частоту в разы сильнее)
+    ua = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    )
+    ctx_kwargs = {
+        "locale": "ru-RU",
+        "timezone_id": "Europe/Moscow",
+        "user_agent": ua,
+        "viewport": {"width": 1440, "height": 900},
+        "screen": {"width": 1920, "height": 1080},
+        "device_scale_factor": 1,
+        "is_mobile": False,
+        "has_touch": False,
+    }
+    context = await browser.new_context(**ctx_kwargs)
     page = await context.new_page()
     await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
     return pw, browser, page
