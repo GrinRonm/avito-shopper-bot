@@ -1,7 +1,8 @@
 """Mini-app сайт: aiohttp-сервер.
 Авторизация: подпись Telegram WebApp initData либо одноразовый код из бота (/link).
 Лоты (фильтры по поиску/статусам, избранное, скрытие, автообновление),
-управление поисками и создание поиска с уточнением кнопками.
+управление поисками, создание поиска с уточнением кнопками и
+режим «Сравнение»: 2-6 лотов -> карточки с Авито -> вердикт нейросети.
 """
 import asyncio
 import hashlib
@@ -128,8 +129,8 @@ async def auth_code(request):
 
 @require_auth
 async def me(request):
-    user = db.list_allowed_users()
-    name = next((u["name"] for u in user if u["chat_id"] == request["chat_id"]), "")
+    users = db.list_allowed_users()
+    name = next((u["name"] for u in users if u["chat_id"] == request["chat_id"]), "")
     return _json({"chat_id": request["chat_id"], "is_owner": bool(request["is_owner"]), "name": name})
 
 
@@ -233,89 +234,245 @@ async def api_flag(request):
     return _json({"ok": val is not None, "value": val})
 
 
+# ============================================================ сравнение
+
+_COMPARES: dict[int, dict] = {}   # chat_id -> {"state": ..., "items": [...], "result": ...
+
+
+async def _do_compare(chat_id: int, rows: list, note: str):
+    state = _COMPARES.setdefault(chat_id, {"state": "processing"})
+    state["state"] = "processing"
+    try:
+        import avito
+        import ai as ai_client
+        cards = []
+        pw, browser, page = await avito.open_browser_context()
+        try:
+            for r in rows:
+                info = await avito.inspect_item(page, r["url"])
+                if info.get("is_reserved"):
+                    info = {"description": "", "params": [], "defect": None}
+                elif info.get("defect"):
+                    d = info["defect"]
+                    info = {"description": f"(Возможный дефект: {d})", "params": [], "defect": d}
+                cards.append({
+                    "title": r["title"],
+                    "price": r["price"],
+                    "params": info.get("params") or [],
+                    "description": info.get("description") or r["snippet"] or "",
+                })
+        finally:
+            await avito.close_browser_context(pw, browser)
+        verdict = await ai_client.compare_items(cards, note)
+        if not verdict:
+            state.update(state="error", error="Нейросеть не вернула ответ — попробуй ещё раз чуть позже")
+            return
+        state.update(state="done", result=verdict, ts=int(time.time()))
+    except Exception as e:
+        log.exception("compare failed")
+        state.update(state="error", error=f"Не удалось: {e}")
+
+
+@require_auth
+async def api_compare_start(request):
+    chat_id = request["chat_id"]
+    body = await request.json()
+    keys = list(body.get("items") or [])[:6]
+    note = (body.get("note") or "").strip()[:500]
+    if len(keys) < 2:
+        return _json({"ok": False, "error": "Добавь минимум 2 товара в сравнение"})
+    rows = []
+    for k in keys:
+        try:
+            sid_s, iid = str(k).split(":", 1)
+            sid = int(sid_s)
+        except Exception:
+            continue
+        s = db.get_search_for_user(sid, chat_id)
+        if not s:
+            continue
+        item = db.get_item_full(sid, iid)
+        if item and item["url"]:
+            rows.append(item)
+    if len(rows) < 2:
+        return _json({"ok": False, "error": "Не нашёл выбранные лоты"})
+    cur = _COMPARES.get(chat_id)
+    if cur and cur.get("state") == "processing":
+        return _json({"ok": False, "error": "Сравнение уже идёт — подожди"})
+    _COMPARES[chat_id] = {"state": "processing", "items": [
+        {"key": k, "title": r["title"], "price": r["price"]} for k, r in zip(keys, rows)], "result": None}
+    asyncio.create_task(_do_compare(chat_id, rows, note))
+    return _json({"ok": True, "state": "processing"})
+
+
+@require_auth
+async def api_compare_status(request):
+    cmp = _COMPARES.get(request["chat_id"]) or {"state": "idle"}
+    return _json(cmp)
+
+
 # ============================================================ страница
 
 PAGE = r"""<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0a0d12">
 <title>🛒 Avito Шопер</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
 :root{
-  --bg:#0d1117; --panel:#161b22; --panel2:#1d2330; --line:#2a3140;
-  --text:#e6e9ef; --muted:#8b94a7; --accent:#3fb26f; --accent2:#3f8cb2;
-  --warn:#d29922; --bad:#e5534b; --chip:#222a37;
+  --bg:#0a0d12; --panel:#11161d; --panel2:#171e28; --panel3:#1c2430;
+  --line:#232b38; --line2:#2e3949;
+  --text:#eaf0f6; --muted:#8a96a8;
+  --accent:#34d399; --accent2:#22d3ee; --violet:#a78bfa; --warn:#fbbf24; --bad:#f87171;
+  --grad:linear-gradient(135deg,#34d399,#22d3ee);
+  --gradc:linear-gradient(135deg,#a78bfa,#7c5cff);
+  --r:16px;
 }
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,'Segoe UI',Roboto,Arial,sans-serif}
-header{position:sticky;top:0;z-index:5;background:linear-gradient(135deg,#0f2027,#134e3a 60%,#1c6b4a);
-  padding:14px 18px;display:flex;align-items:center;gap:14px;box-shadow:0 2px 10px rgba(0,0,0,.4)}
-header h1{font-size:18px;margin:0;font-weight:700;letter-spacing:.3px}
-header .who{margin-left:auto;font-size:12px;color:#cfe9dd}
-nav{display:flex;gap:8px}
-nav button{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.18);color:#fff;
-  border-radius:10px;padding:7px 16px;cursor:pointer;font-size:14px;transition:.15s}
-nav button.on{background:#fff;color:#123d2c;border-color:#fff;font-weight:600}
-.wrap{max-width:1000px;margin:0 auto;padding:16px}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px 16px;margin:10px 0;transition:.15s}
-.card:hover{border-color:#3a4456}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,system-ui,'Segoe UI',Roboto,Arial,sans-serif;-webkit-font-smoothing:antialiased}
+body{min-height:100vh;padding-bottom:calc(var(--nav-h) + env(safe-area-inset-bottom) + 8px)}
+
+/* ---------- header ---------- */
+header{position:sticky;top:0;z-index:10;display:flex;align-items:center;gap:10px;
+  padding:12px 16px;background:rgba(10,13,18,.86);backdrop-filter:blur(14px);
+  border-bottom:1px solid var(--line)}
+.logo{width:34px;height:34px;border-radius:11px;background:var(--grad);display:flex;align-items:center;justify-content:center;font-size:18px;box-shadow:0 2px 12px rgba(52,211,153,.35)}
+h1{font-size:17px;margin:0;font-weight:800;letter-spacing:.2px}
+h1 small{display:block;font-size:10.5px;color:var(--muted);font-weight:600;letter-spacing:1.4px;text-transform:uppercase}
+.who{margin-left:auto;font-size:11.5px;color:var(--muted);text-align:right}
+
+/* ---------- bottom nav ---------- */
+nav{--nav-h:64px;position:fixed;z-index:20;left:0;right:0;bottom:0;display:flex;
+  justify-content:space-around;align-items:stretch;height:calc(var(--nav-h) + env(safe-area-inset-bottom));
+  padding-bottom:env(safe-area-inset-bottom);
+  background:rgba(13,17,24,.92);backdrop-filter:blur(16px);border-top:1px solid var(--line)}
+nav .tab{flex:1;max-width:130px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;
+  color:var(--muted);font-size:10.5px;font-weight:700;cursor:pointer;position:relative;transition:color .15s}
+nav .tab .ic{font-size:21px;line-height:1;filter:grayscale(1) opacity(.75);transition:.15s}
+nav .tab.on{color:var(--accent)}
+nav .tab.on .ic{filter:none;transform:translateY(-2px)}
+nav .tab.on::before{content:'';position:absolute;top:0;width:26px;height:3px;border-radius:0 0 3px 3px;background:var(--grad)}
+nav .tab .nub{position:absolute;top:6px;right:calc(50% - 20px);min-width:16px;height:16px;border-radius:9px;
+  background:var(--gradc);color:#fff;font-size:9.5px;font-weight:800;display:none;align-items:center;justify-content:center;padding:0 4px}
+nav .tab.sel .nub{display:flex}
+
+/* ---------- layout ---------- */
+.wrap{max-width:980px;margin:0 auto;padding:14px 14px 10px}
+viewtabs{display:none}
+.card{background:linear-gradient(180deg,var(--panel2),var(--panel));border:1px solid var(--line);
+  border-radius:var(--r);padding:14px;margin:10px 0;transition:border-color .15s}
+.card:hover{border-color:var(--line2)}
 .row{display:flex;gap:12px;align-items:flex-start}
 .grow{flex:1;min-width:0}
 .muted{color:var(--muted);font-size:12px}
-.pricing{font-weight:700;font-size:16px;color:#9fe0b7}
-.badge{display:inline-block;padding:2px 9px;border-radius:10px;font-size:11px;font-weight:600;color:#fff;vertical-align:2px}
-.b-match{background:var(--accent)} .b-close{background:var(--warn)} .b-reject{background:var(--bad)}
-.b-nodata{background:#57606a} .b-defect{background:#444c56}
-.b-active{background:var(--accent2)} .b-paused{background:var(--warn)} .b-stopped{background:var(--bad)}
-.b-asking{background:#58a6ff} .b-planning{background:#8957e5}
-.chips{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0}
-.chip{padding:6px 13px;border:1px solid var(--line);border-radius:18px;background:var(--chip);color:var(--muted);cursor:pointer;font-size:13px;transition:.15s}
-.chip.on{background:var(--accent);border-color:var(--accent);color:#04120a;font-weight:600}
-.item-btn{border:1px solid var(--line);background:var(--panel2);border-radius:9px;padding:5px 11px;cursor:pointer;margin:2px;color:var(--text);font-size:13px}
-.item-btn:hover{border-color:#4a5568}
-.item-btn.on{background:#f6d15a;border-color:#f6d15a;color:#201a02}
-.item-btn.danger:hover{border-color:var(--bad);color:var(--bad)}
-a{color:#6cb6ff;text-decoration:none} a:hover{text-decoration:underline}
-.hidden-item{opacity:.5}
-.empty{text-align:center;color:var(--muted);padding:46px 0;font-size:15px}
-.spinner{display:inline-block;width:15px;height:15px;border:2px solid #888;border-top-color:transparent;border-radius:50%;animation:sp .7s linear infinite;vertical-align:-3px}
+.title4{font-size:16.5px;font-weight:800}
+section h3{margin:2px 0 0;font-size:16px;font-weight:800}
+
+/* ---------- chips ---------- */
+.chips{display:flex;gap:7px;overflow-x:auto;padding:10px 14px;scrollbar-width:none;
+  position:sticky;top:58px;z-index:8;background:linear-gradient(180deg,var(--bg) 70%,transparent)}
+.chips::-webkit-scrollbar{display:none}
+.chip{flex:0 0 auto;padding:7px 14px;border:1px solid var(--line);border-radius:20px;background:var(--panel2);
+  color:var(--muted);cursor:pointer;font-size:12.5px;font-weight:650;transition:.15s;white-space:nowrap}
+.chip.on{background:var(--accent);border-color:var(--accent);color:#05231a;font-weight:750}
+
+/* ---------- item card ---------- */
+.pricing{font-weight:800;font-size:18px;color:var(--accent);letter-spacing:.2px}
+.badge{display:inline-block;padding:2.5px 9px;border-radius:10px;font-size:10.5px;font-weight:750;color:#0a0d12;vertical-align:1px}
+.b-match{background:var(--warn)}/* совпадение */ .b-match{background:#a9f0cd}
+.b-close{background:var(--warn)}
+.b-reject{background:var(--bad);color:#fff}
+.b-nodata{background:#3a4454;color:#c6cfe0} .b-defect{background:#3a4454;color:#c6cfe0}
+.b-active{background:var(--accent2)} .b-paused{background:var(--warn)} .b-stopped{background:var(--bad);color:#fff}
+.b-asking{background:#8ab4ff} .b-planning{background:var(--violet)}
+.acts{display:flex;gap:6px;flex-shrink:0}
+.it-btn{width:40px;height:40px;border:1px solid var(--line);background:var(--panel3);border-radius:12px;
+  cursor:pointer;font-size:17px;color:var(--text);transition:.15s;line-height:1}
+.it-btn:hover{border-color:var(--line2);transform:translateY(-1px)}
+.it-btn.on{background:linear-gradient(135deg,rgba(251,191,36,.25),rgba(251,191,36,.1));border-color:var(--warn)}
+.it-btn.cmp.on{background:linear-gradient(135deg,rgba(167,139,250,.28),rgba(124,92,255,.12));border-color:var(--violet)}
+.it-btn.danger:hover{border-color:var(--bad)}
+a.lnk{color:var(--accent2);text-decoration:none;font-size:12.5px;font-weight:650}
+.hidden-item{opacity:.45;filter:saturate(.4)}
+
+/* ---------- пустые / загрузка ---------- */
+.ghosting{text-align:center;color:var(--muted);padding:50px 16px;font-size:14.5px;line-height:1.6}
+.ghosting b{display:block;font-size:34px;margin-bottom:8px;filter:grayscale(.15)}
+.spinner{display:inline-block;width:15px;height:15px;border:2px solid #6b7488;border-top-color:var(--accent);border-radius:50%;animation:sp .7s linear infinite;vertical-align:-3px}
 @keyframes sp{to{transform:rotate(360deg)}}
-textarea{width:100%;min-height:96px;background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:10px;padding:10px;font:inherit;font-size:15px;resize:vertical}
-textarea:focus,input:focus{outline:none;border-color:var(--accent)}
-input{background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:10px;padding:10px;font:inherit;width:100%}
-.primary{background:var(--accent);border:none;color:#04120a;font-weight:700;border-radius:10px;padding:10px 18px;cursor:pointer;font-size:14px;margin-top:10px}
-.primary:disabled{opacity:.5;cursor:not-allowed}
-.must{margin:6px 0 0;padding-left:18px;font-size:12.5px;color:#c4cbd8;line-height:1.5}
-.must .no{color:#f08d8a}
-.tag{display:inline-block;background:var(--chip);border-radius:8px;padding:2px 8px;font-size:11px;color:var(--muted);margin-right:5px}
-.center{text-align:center}
-#login{max-width:380px;margin:80px auto}
-.toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--accent);color:#04120a;
-  padding:10px 20px;border-radius:12px;font-weight:600;opacity:0;transition:.3s;z-index:20}
-.toast.show{opacity:1}
-.toast.err{background:var(--bad);color:#fff}
+.skel{height:86px;border-radius:var(--r);background:var(--panel);border:1px solid var(--line);margin:10px 0;position:relative;overflow:hidden}
+.skel::after{content:'';position:absolute;inset:0;background:linear-gradient(90deg,transparent,rgba(255,255,255,.05),transparent);animation:shimmer 1.5s infinite}
+@keyframes shimmer{to{transform:translateX(100%)}}
+
+/* ---------- формы ---------- */
+textarea,input{width:100%;background:var(--panel3);color:var(--text);border:1px solid var(--line);
+  border-radius:12px;padding:11px 13px;font:inherit;font-size:14.5px;resize:vertical}
+textarea{min-height:96px}
+textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(52,211,153,.12)}
+.btn{border:none;border-radius:12px;padding:12px 20px;font-size:14px;font-weight:800;cursor:pointer;transition:.15s;color:#05231a}
+.btn.primary{background:var(--grad)}
+.btn.violet{background:var(--gradc);color:#fff}
+.btn:disabled{opacity:.45;cursor:not-allowed;filter:grayscale(.4)}
+.btn.ghost{background:var(--panel3);border:1px solid var(--line);color:var(--text)}
+.must{margin:8px 0 0;padding-left:18px;font-size:12.5px;color:#c4cbd8;line-height:1.55}
+.must .no{color:#f19994}
+
+/* ---------- compare ---------- */
+.pick{display:flex;align-items:center;gap:10px;background:var(--panel2);border:1px solid var(--line);
+  border-radius:12px;padding:9px 12px;margin:7px 0}
+.pick.rm{margin-left:auto;background:none;border:none;color:var(--bad);font-size:16px;cursor:pointer}
+.phone-note{margin:10px 0 0}
+.cmp-result .winner{border:1.5px solid transparent;background:linear-gradient(var(--panel2),var(--panel)) padding-box,var(--gradc);border-radius:var(--r);padding:14px;margin:10px 0}
+.cmp-result .winner h4{margin:0 0 6px;font-size:15.5px;color:var(--violet)}
+.cmp-result .why{color:#cfe8de;font-size:13.5px;line-height:1.6;white-space:pre-wrap}
+.cmp-result details{margin:8px 0;border:1px solid var(--line);border-radius:12px;padding:10px 13px;background:var(--panel)}
+.cmp-result summary{cursor:pointer;font-weight:700;font-size:13px;color:var(--text)}
+.cmp-result .tips{margin-top:10px;font-size:12.5px;background:rgba(251,191,36,.08);border:1px solid rgba(251,191,36,.25);color:#f3dcc0;border-radius:12px;padding:10px 13px;line-height:1.55}
+
+/* ---------- toast ---------- */
+.toast{position:fixed;bottom:calc(var(--nav-h) + env(safe-area-inset-bottom) + 12px + var(--x,0px));left:50%;transform:translateX(-50%) translateY(8px);
+  background:#122b22;color:#b9f5dc;border:1px solid rgba(52,211,153,.4);padding:11px 20px;border-radius:13px;
+  font-weight:700;font-size:13px;opacity:0;transition:.25s;z-index:30;pointer-events:none;max-width:92vw;text-align:center}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+.toast.err{background:#2b1214;color:#ffd2d0;border-color:rgba(248,113,113,.45)}
+
+/* login */
+#login{max-width:380px;margin:70px auto}
+@media(min-width:900px){
+  body{padding-bottom:20px}
+  nav{--nav-h:auto;position:static;height:auto;padding:0;background:none;border:none;justify-content:flex-start;gap:6px;margin-left:10px}
+  nav .tab{flex:none;flex-direction:row;gap:7px;font-size:13px;padding:9px 16px;border:1px solid var(--line);border-radius:24px;background:var(--panel2);color:var(--muted)}
+  nav .tab.on{border-color:transparent;color:#05231a;background:var(--grad)}
+  nav .tab.on .ic{transform:none}
+  nav .tab .nub{position:static;display:flex;min-width:17px;height:17px;margin-top:-4px}
+  nav .tab.sel:not(.on) .nub{display:flex}
+  .chips{position:sticky;top:64px;padding:10px 0}
+}
 </style>
 </head>
 <body>
 <header>
-  <h1>🛒 Avito Шопер</h1>
-  <nav>
-    <button id="t-items" class="on" onclick="setTab('items')">📦 Лоты</button>
-    <button id="t-searches" onclick="setTab('searches')">🔍 Поиски</button>
-    <button id="t-new" onclick="setTab('new')">➕ Новый поиск</button>
-  </nav>
+  <div class="logo">🛒</div>
+  <h1>Avito Шопер<small>поиск под тебя</small></h1>
   <div class="who" id="who"></div>
+  <nav id="nav">
+    <div class="tab on" data-tab="items" onclick="setTab('items')"><span class="ic">📦</span>Лоты</div>
+    <div class="tab" data-tab="searches" onclick="setTab('searches')"><span class="ic">🔍</span>Поиски</div>
+    <div class="tab" data-tab="cmp" onclick="setTab('cmp')"><span class="ic">⚖️</span>Сравнение<span class="nub" id="cmp-nub">0</span></div>
+    <div class="tab" data-tab="new" onclick="setTab('new')"><span class="ic">➕</span>Новый</div>
+  </nav>
 </header>
 
 <div id="login" class="wrap">
   <div class="card">
     <h3>Вход</h3>
-    <p class="muted">Если открыл сайт из бота (кнопка «🌐 Открыть мини-ап») — вход произойдёт сам.
+    <p class="muted">Если открыл сайт из бота ( кнопка «🌐 Веб-приложение» ) — вход произойдёт сам.
     Иначе введи код, который выдаст бот командой <b>/link</b>.</p>
     <input id="code" placeholder="6-значный код" inputmode="numeric" maxlength="6">
-    <button class="primary" onclick="loginByCode()">Войти</button>
+    <div style="margin-top:10px"><button class="btn primary" onclick="loginByCode()">Войти</button></div>
     <p id="login-err" class="muted" style="color:var(--bad)"></p>
   </div>
 </div>
@@ -329,17 +486,34 @@ input{background:var(--panel2);color:var(--text);border:1px solid var(--line);bo
       <button class="chip" onclick="setMode(this,'rejected')">Отброшенные</button>
       <button class="chip" onclick="setMode(this,'all')">Все</button>
     </div>
-    <div class="chips" id="search-chips"><button class="chip on" onclick="setSearchFilter(this,null)">Все поиски</button></div>
+    <div class="chips" id="search-chips" style="margin-top:-4px"><button class="chip on" onclick="setSearchFilter(this,null)">Все поиски</button></div>
     <div id="items-list"></div>
   </div>
+
   <div id="v-searches" style="display:none"><div id="searches-list"></div></div>
+
+  <div id="v-cmp" style="display:none">
+    <div id="cmp-basket"></div>
+    <div class="card" id="cmp-controls" style="display:none">
+      <p class="muted phone-note" style="margin:0 0 8px">Нейросеть зайдёт на Авито и сравнит карточки целиком.
+        Можно уточнить, что для тебя важнее:</p>
+      <input id="cmp-note" placeholder="например: важен вес и батарея, а не камера">
+      <div style="margin-top:10px;display:flex;gap:8px">
+        <button class="btn violet" id="cmp-go" onclick="startCompare()">⚖️ Сравнить</button>
+        <button class="btn ghost" onclick="clearCmp()">Очистить</button>
+      </div>
+      <div id="cmp-box"></div>
+    </div>
+    <div class="ghosting" id="cmp-empty">⚖️ Отметь 2–6 лотов кнопкой ⚖️ в списке лотов — и сравни их здесь.</div>
+  </div>
+
   <div id="v-new" style="display:none">
     <div class="card">
       <h3>Новый поиск</h3>
       <p class="muted">Опиши желаемое обычным текстом, например: <i>«найди ноутбук 16/512, бренды asus и redmi,
       Ryzen но не U-серии, экран 13–15.6, от 40 до 70 тысяч»</i></p>
       <textarea id="new-text" placeholder="ноутбук 16/512, asus/redmi, Ryzen без U, экран 13-15.6, 40-70к"></textarea>
-      <button class="primary" id="new-btn" onclick="createSearch()">🧠 Собрать план поиска</button>
+      <div style="margin-top:10px"><button class="btn primary" id="new-btn" onclick="createSearch()">🧠 Собрать план поиска</button></div>
       <div id="new-status"></div>
     </div>
   </div>
@@ -351,14 +525,14 @@ input{background:var(--panel2);color:var(--text);border:1px solid var(--line);bo
 const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
 if (tg) { tg.ready(); tg.expand(); }
 
-let state = { tab:'items', mode:'notified', searchFilter:null, sid:null, searches:[], pollItems:null, pollNew:null };
+let state = { tab:'items', mode:'notified', searchFilter:null, sid:null, searches:[], pollItems:null, pollNew:null, cmp:[], curQ:null };
 
-function rub(v){ return v ? Number(v).toLocaleString('ru-RU')+' ₽' : '—'; }
 function esc(s){ return (s??'').toString().replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;'); }
+function rub(v){ return v ? Number(v).toLocaleString('ru-RU')+' ₽' : '—'; }
 function toast(msg, err){
   const t = document.getElementById('toast');
   t.textContent = msg; t.classList.toggle('err', !!err); t.classList.add('show');
-  setTimeout(()=>t.classList.remove('show'), 3500);
+  setTimeout(()=>t.classList.remove('show'), 3200);
 }
 async function api(path, body, method){
   const opt = {method: method || (body?'POST':'GET'), headers:{'Content-Type':'application/json'}};
@@ -373,13 +547,15 @@ function stopPollers(){
 }
 function setTab(t){
   state.tab = t; stopPollers();
-  ['items','searches','new'].forEach(x=>{
+  ['items','searches','cmp','new'].forEach(x=>{
     document.getElementById('v-'+x).style.display = x===t?'block':'none';
-    const b = document.getElementById('t-'+x); if(b) b.className = x===t?'on':'';
   });
+  document.querySelectorAll('#nav .tab').forEach(el=>el.classList.toggle('on', el.dataset.tab===t));
   if (t==='items'){ loadItems(); state.pollItems = setInterval(loadItems, 8000); }
   if (t==='searches') loadSearches();
+  if (t==='cmp'){ renderCmp(); pollCompare(); }
   if (t==='new') document.getElementById('new-text').focus();
+  window.scrollTo(0,0);
 }
 
 // ---------------- auth ----------------
@@ -397,31 +573,44 @@ function logoutUI(){
 
 // ---------------- boot ----------------
 async function startBoot(){
-  // телеграм initData
   if (tg && tg.initData) {
     try {
       const r = await api('/api/auth/tg', {initData: tg.initData});
       if (!r.ok) { toast('Не удалось проверить подпись', true); return; }
       if (r.allowed === false) { document.getElementById('login').innerHTML =
-        '<div class="card"><h3>⏳ Заявка отправлена</h3><p class="muted">Жди одобрения от владельца бота.</p></div>'; return; }
+        '<div class="card"><h3>⏳ Заявка отправлена</h3><p class="muted">Жди одобрения от владельца бота. Тогда в боте /link тоже сработает.</p></div>'; return; }
     } catch(e) {}
   }
-  // есть ли уже сессия (cookie)?
-  try {
-    const r = await api('/api/me');
-    startApp(r);
-  } catch(e) { /* нет сессии — остаётся форма входа */ }
+  try { await startApp(); } catch(e) { /* нет сессии — остаётся форма входа */ }
 }
-
-async function startApp(me){
-  try { if (!me) me = await api('/api/me'); } catch(e) { logoutUI(); return; }
+async function startApp(){
+  let me;
+  try { me = await api('/api/me'); } catch(e) { logoutUI(); return; }
   document.getElementById('login').style.display='none';
   document.getElementById('app').style.display='block';
-  document.getElementById('who').textContent = (me.name || '') + ' · id' + me.chat_id;
+  document.getElementById('who').textContent = (me.name || '') + ' · ' + me.chat_id;
+  loadChips();
   setTab('items');
 }
 
-// ---------------- лоты ----------------
+// ---------------- чипсы: фильтры по поискам ----------------
+async function loadChips(){
+  state.searches = await api('/api/searches');
+  const chips = document.getElementById('search-chips');
+  chips.innerHTML = '';
+  const all = document.createElement('button');
+  all.className = 'chip'+(state.searchFilter===null?' on':'');
+  all.textContent = 'Все поиски';
+  all.onclick = ()=>setSearchFilter(all, null);
+  chips.appendChild(all);
+  state.searches.filter(s=>s.items_count > 0).forEach(s=>{
+    const b = document.createElement('button');
+    b.className = 'chip'+(state.searchFilter===s.id?' on':'');
+    b.textContent = `#${s.id} ${esc(s.title).slice(0,26)}`;
+    b.onclick = ()=>setSearchFilter(b, s.id);
+    chips.appendChild(b);
+  });
+}
 function setMode(el, m){
   state.mode = m;
   document.querySelectorAll('#mode-chips .chip').forEach(c=>c.classList.remove('on'));
@@ -434,38 +623,45 @@ function setSearchFilter(el, sid){
   el.classList.add('on');
   loadItems();
 }
+
+// ---------------- лоты ----------------
 function verBadge(i){
   if (i.verdict === 'MATCH') return '<span class="badge b-match">✅ совпадение</span>';
   if (i.verdict === 'CLOSE') return '<span class="badge b-close">🟡 возможно</span>';
-  if (i.verdict === 'REJECT') return '<span class="badge b-reject">Не подходит</span>';
+  if (i.verdict === 'REJECT') return '<span class="badge b-reject">не подходит</span>';
   if (i.status === 'RESERVED') return '<span class="badge b-defect">зарезервирован</span>';
   if (i.status.startsWith('REJECTED') || i.status === 'SCREENED_NO') return '<span class="badge b-defect">отсеян</span>';
   if (i.status === 'NO_DATA') return '<span class="badge b-nodata">нет данных</span>';
   return '';
 }
+function cmpOn(i){ return state.cmp.includes(i.search_id+':'+i.avito_id); }
 async function loadItems(){
+  const box = document.getElementById('items-list');
   const q = new URLSearchParams({mode: state.mode});
   if (state.searchFilter) q.set('search_id', state.searchFilter);
   let items;
   try { items = await api('/api/items?'+q); } catch(e){ return; }
-  const box = document.getElementById('items-list');
+  state.itemsCache = items;
+  loadChips(); // обновляем фильтры-чипсы (если нет — покажется только «Все поиски»)
   if (!items.length){
-    box.innerHTML = '<div class="empty">Ничего не найдено — начни поиск на вкладке «➕ Новый поиск»</div>';
+    box.innerHTML = '<div class="ghosting"><b>📭</b>Ничего не найдено.<br>Начни поиск на вкладке «➕ Новый» или переключи фильтр.</div>';
     return;
   }
   box.innerHTML = items.map(i=>{
+    const inCmp = cmpOn(i);
     return `<div class="card ${i.hidden?'hidden-item':''}">
       <div class="row">
         <div class="grow">
-          <div><span class="tag">#${i.search_id}</span> <b>${esc(i.title)}</b> ${verBadge(i)} ${i.favorite?'⭐':''}</div>
-          <div><span class="pricing">${rub(i.price)}</span> <span class="muted">· ${esc(i.search_title)}</span></div>
-          <div class="muted">${esc((i.reason||i.snippet||'').slice(0,220))}</div>
-          <div class="muted">${esc(i.created_at||'')}</div>
-          <a href="${esc(i.url)}" target="_blank">Открыть на Авито ↗</a>
+          <div style="font-size:14.5px;font-weight:750;line-height:1.35">${esc(i.title)}</div>
+          <div style="margin:5px 0 2px"><span class="pricing">${rub(i.price)}</span> ${verBadge(i)} ${i.favorite?'⭐':''} ${i.hidden?' 👻':''}</div>
+          <div class="muted" style="margin:4px 0 2px">${esc((i.reason||i.snippet||'').slice(0,220))}</div>
+          <div class="muted">${esc(i.created_at||'')} · поиск «${esc(i.search_title)}»</div>
+          <a class="lnk" href="${esc(i.url)}" target="_blank" rel="noopener">Открыть на Авито ↗</a>
         </div>
-        <div style="white-space:nowrap">
-          <button class="item-btn ${i.favorite?'on':''}" title="В избранное" onclick="toggleFlag(${i.search_id},'${i.avito_id}','favorite')">⭐</button>
-          <button class="item-btn ${i.hidden?'on':''}" title="Скрыть/вернуть" onclick="toggleFlag(${i.search_id},'${i.avito_id}','hidden')">👁</button>
+        <div class="acts">
+          <button class="it-btn ${i.favorite?'on':''}" onclick="toggleFlag('${i.search_id}','${esc(i.avito_id)}','favorite')" title="В избранное">⭐</button>
+          <button class="it-btn cmp ${inCmp?'on':''}" onclick="toggleCmp('${i.search_id}','${esc(i.avito_id)}',this)" title="В сравнение">⚖️</button>
+          <button class="it-btn ${i.hidden?'on':'danger'}" onclick="toggleFlag('${i.search_id}','${esc(i.avito_id)}','hidden')" title="Скрыть/вернуть">👁</button>
         </div>
       </div>
     </div>`;
@@ -476,27 +672,95 @@ async function toggleFlag(sid, iid, field){
   loadItems();
 }
 
+// ---------------- сравнение ----------------
+function toggleCmp(sid, iid, btn){
+  const key = sid+':'+iid;
+  const idx = state.cmp.indexOf(key);
+  if (idx >= 0) { state.cmp.splice(idx, 1); if (btn) btn.classList.remove('on'); }
+  else if (state.cmp.length >= 6) { toast('Максимум 6 товаров', true); return; }
+  else { state.cmp.push(key); if (btn) btn.classList.add('on'); }
+  updateCmpNub();
+  if (state.tab === 'cmp') renderCmp();
+}
+function updateCmpNub(){
+  const nub = document.getElementById('cmp-nub');
+  nub.textContent = state.cmp.length;
+  document.querySelector('#nav .tab[data-tab="cmp"]').classList.toggle('sel', state.cmp.length>0);
+}
+function clearCmp(){ state.cmp = []; updateCmpNub(); renderCmp(); if (state.tab==='items') loadItems(); }
+function renderCmp(){
+  const box = document.getElementById('cmp-basket');
+  const controls = document.getElementById('cmp-controls');
+  const empty = document.getElementById('cmp-empty');
+  updateCmpNub();
+  if (!state.cmp.length){
+    box.innerHTML = ''; controls.style.display = 'none';
+    empty.style.display = 'block';
+    return;
+  }
+  empty.style.display = 'none';
+  controls.style.display = 'block';
+  const rows = state.cmp.map(key=>{
+    const [sid, iid] = key.split(':');
+    const it = (state.itemsCache||[]).find(i=>i.search_id+':'+i.avito_id===key);
+    const title = it ? it.title : 'лот #'+iid;
+    const price = it ? it.price : 0;
+    return `<div class="pick"><div class="grow"><b style="font-size:13px">${esc(title).slice(0,60)}</b>
+      <span class="muted">   · ${rub(price)}</span></div>
+      <button class="rm" onclick="rmCmp('${key}')">✕</button></div>`;
+  }).join('');
+  box.innerHTML = `<div class="card"><h3>⚖️ В сравнении (${state.cmp.length})</h3>${rows}</div>`;
+}
+function rmCmp(key){
+  state.cmp = state.cmp.filter(k=>k!==key);
+  updateCmpNub(); renderCmp(); if (state.tab==='items') loadItems();
+}
+async function startCompare(){
+  if (state.cmp.length < 2) { toast('Нужно минимум 2 товара', true); return; }
+  const btn = document.getElementById('cmp-go');
+  btn.disabled = true;
+  const r = await api('/api/compare', {items: state.cmp, note: document.getElementById('cmp-note').value.trim()});
+  if (!r.ok) { toast(r.error, true); btn.disabled = false; return; }
+  toast('Отправил в нейросеть — следи тут');
+  pollCompare();
+}
+function stopCmpPoll(){
+  if (window._cmpPoll) { clearInterval(window._cmpPoll); window._cmpPoll = null; }
+}
+async function pollCompare(){
+  let c;
+  try { c = await api('/api/compare'); } catch(e){ return; }
+  const box = document.getElementById('cmp-box');
+  if (c.state === 'processing'){
+    box.innerHTML = `<div class="card"><div id="cmpline"><span class="spinner"></span> Снимаю карточки с Авито и спрашиваю нейросеть…</div></div>`;
+    stopCmpPoll();
+    window._cmpPoll = setInterval(async ()=>{ try{ await pollCompare(); }catch(e){} }, 3000);
+    return;
+  }
+  stopCmpPoll();
+  document.getElementById('cmp-go').disabled = false;
+  if (c.state === 'error'){ box.innerHTML = `<div class="card"><b style="color:var(--bad)">:( ${esc(c.error||'Ошибка')}</b></div>`; return; }
+  if (c.state === 'done' && c.result){
+    const v = c.result;
+    const details = (v.details||[]).map(d=>`<li style="margin:5px 0;color:#c4cbd8;font-size:13px">${esc(d)}</li>`).join('');
+    box.innerHTML = `<div class="cmp-result">
+      <div class="card winner"><h4>🏆 Вариант №${v.winner+1} — лучший по мнению нейросети</h4>
+        <div class="muted" style="margin-bottom:6px">${esc((c.items[v.winner]||{}).title||'')}</div>
+        <div style="font-size:15px;font-weight:750;line-height:1.5">${esc(v.summary)}</div></div>
+      <details open><summary>Почему → ${esc((c.items[v.winner]||{}).title||'').slice(0,50)}</summary>
+        <div class="why">${esc(v.why)}</div></details>
+      <details><summary>Разбор всех вариантов</summary><ul>${details}</ul></details>
+      <div class="tips">💡 ${esc(v.tips)}</div>
+    </div>`;
+  }
+  if (c.state === 'idle') { box.innerHTML=''; }
+}
+
 // ---------------- поиски ----------------
 async function loadSearches(){
-  state.searches = await api('/api/searches');
-  // чипы фильтра лотов
-  const chips = document.getElementById('search-chips');
-  chips.innerHTML = '';
-  const all = document.createElement('button');
-  all.className = 'chip'+(state.searchFilter===null?' on':'');
-  all.textContent = 'Все поиски';
-  all.onclick = ()=>setSearchFilter(all, null);
-  chips.appendChild(all);
-  state.searches.filter(s=>['ACTIVE','PAUSED','ASKING','PLANNING'].includes(s.status)).forEach(s=>{
-    const b = document.createElement('button');
-    b.className = 'chip'+(state.searchFilter===s.id?' on':'');
-    b.textContent = `#${s.id} ${esc(s.title).slice(0,28)}`;
-    b.onclick = ()=>setSearchFilter(b, s.id);
-    chips.appendChild(b);
-  });
-  // список
+  await loadChips();
   const box = document.getElementById('searches-list');
-  if (!state.searches.length){ box.innerHTML = '<div class="empty">Поисков ещё нет</div>'; return; }
+  if (!state.searches.length){ box.innerHTML = '<div class="ghosting"><b>🔍</b>Поисков ещё нет.<br>Создай первый на вкладке «➕ Новый».</div>'; return; }
   box.innerHTML = state.searches.map(s=>{
     const bm = {ACTIVE:'b-active',PAUSED:'b-paused',STOPPED:'b-stopped',ASKING:'b-asking',PLANNING:'b-planning',PLANNING_FAILED:'b-reject'};
     const p = s.profile || {};
@@ -506,28 +770,33 @@ async function loadSearches(){
     const must = (p.must||[]).map(m=>`<li>${esc(m)}</li>`).join('');
     const no = (p.must_not||[]).map(m=>`<li class="no">🚫 ${esc(m)}</li>`).join('');
     let acts = '';
-    if (s.status==='ACTIVE') acts += `<button class="item-btn" onclick="sact(${s.id},'pause')">⏸ Пауза</button>`;
-    if (s.status==='PAUSED') acts += `<button class="item-btn" onclick="sact(${s.id},'resume')">▶️ Возобновить</button>`;
-    if (s.status==='STOPPED') acts += `<button class="item-btn" onclick="sact(${s.id},'resume')">▶️</button>`;
-    if (s.status==='PLANNING_FAILED') acts += `<button class="item-btn" onclick="sact(${s.id},'replan')">🔄 Заново</button>`;
-    if (s.status!=='STOPPED' && s.status!=='ASKING' && s.status!=='PLANNING') acts += `<button class="item-btn danger" onclick="sact(${s.id},'stop')">🛑 Завершить</button>`;
-    acts += `<button class="item-btn danger" onclick="sdel(${s.id})">🗑</button>`;
+    if (s.status==='ACTIVE') acts += `<button class="it-btn" style="width:auto;padding:0 14px" onclick="sact(${s.id},'pause')">⏸ Пауза</button>`;
+    if (s.status==='PAUSED') acts += `<button class="it-btn" style="width:auto;padding:0 14px" onclick="sact(${s.id},'resume')">▶️ Возобновить</button>`;
+    if (s.status==='STOPPED') acts += `<button class="it-btn" style="width:auto;padding:0 14px" onclick="sact(${s.id},'resume')">▶️</button>`;
+    if (s.status==='PLANNING_FAILED') acts += `<button class="it-btn" style="width:auto;padding:0 14px" onclick="sact(${s.id},'replan')">🔄 Заново</button>`;
+    if (s.status!=='STOPPED' && s.status!=='ASKING' && s.status!=='PLANNING') acts += `<button class="it-btn danger" style="width:auto;padding:0 14px" onclick="sact(${s.id},'stop')">🛑 Завершить</button>`;
+    acts += `<button class="it-btn danger" onclick="sdel(${s.id})">🗑</button>`;
     const asks = (s.status==='ASKING'||s.status==='PLANNING');
     return `<div class="card">
       <div class="row">
         <div class="grow">
-          <div><b>#${s.id} ${esc(s.title)}</b> <span class="badge ${bm[s.status]||'b-nodata'}">${s.status}</span></div>
-          <div class="muted" style="margin:4px 0">${price} · 📍 ${esc(cities)}${del}</div>
+          <div><b>№${s.id} ${esc(s.title)}</b> <span class="badge ${bm[s.status]||'b-nodata'}">${ruStatus(s.status)}</span></div>
+          <div class="muted" style="margin:5px 0">${price} · 📍 ${esc(cities)}${del}</div>
           <ul class="must">${must}${no}</ul>
-          <div class="muted" style="margin-top:6px">лотов: ${s.items_count} · показано: ${s.matched_count} · обновлён: ${esc(s.last_scan_at||'—')}</div>
+          <div class="muted" style="margin-top:7px">лотів: ${s.items_count} · показано: ${s.matched_count} · обновлён: ${esc(s.last_scan_at||'—')}</div>
         </div>
-        ${asks?'':`<div style="white-space:nowrap">${acts}</div>`}
+        ${asks?'':`<div class="acts">${acts}</div>`}
       </div>
     </div>`;
   }).join('');
-  // если поиск в уточнении — покажем ссылку на вкладку «Новый»
+  // если поиск “уточняется” — подскажем, что диалог на вкладке Новый
   const asking = state.searches.find(s=>s.status==='ASKING'||s.status==='PLANNING');
-  if (asking && state.tab!=='new') { /* индикатор */ }
+  if (asking) box.insertAdjacentHTML('afterbegin',
+    `<div class="card" style="border-color:var(--violet)"><b>🧠 Поиск №${asking.id} сейчас формируется/уточняется</b>
+     <div class="muted" style="margin-top:4px">Открыт диалог на вкладке «➕ Новый» — два поиска одновременно запустить нельзя.</div></div>`);
+}
+function ruStatus(st){
+  return {ACTIVE:'активен',PAUSED:'пауза',STOPPED:'остановлен',ASKING:'уточняем',PLANNING:'формируем',PLANNING_FAILED:'ошибка'}[st]||st;
 }
 function cityName(slug){
   const m = {"rossiya":"Россия","novokuznetsk":"Новокузнецк","kemerovo":"Кемерово","novosibirsk":"Новосибирск","moskva":"Москва","spb":"СПб"};
@@ -535,58 +804,64 @@ function cityName(slug){
 }
 async function sact(id, act){
   await api(`/api/searches/${id}/${act}`, {});
-  loadSearches();
-  toast('Готово');
+  loadSearches(); toast('Готово');
 }
 async function sdel(id){
-  if (!confirm('Удалить поиск #'+id+' вместе со лотами?')) return;
+  if (!confirm('Удалить поиск №'+id+' вместе с его лотами?')) return;
   await api(`/api/searches/${id}/delete`, {});
-  loadSearches();
-  if (state.searchFilter===id) setSearchFilterByFirst();
+  await loadSearches();
+  if (state.searchFilter===id){ state.searchFilter = null; loadItems(); }
   toast('Удалён');
 }
-function setSearchFilterByFirst(){ state.searchFilter=null; loadSearches(); loadItems(); }
 
 // ---------------- создание поиска ----------------
 async function createSearch(){
   const text = document.getElementById('new-text').value.trim();
   const btn = document.getElementById('new-btn');
-  btn.disabled = true;
-  const r = await api('/api/search', {text});
-  if (!r.ok){ toast(r.error, true); btn.disabled = false; return; }
+  const r = await api('/api/search', {text}).catch(e=>null);
+  if (!r || !r.ok){ toast(r?.error || 'Ошибка', true); return; }
   state.sid = r.sid;
+  btn.disabled = true;
   document.getElementById('new-text').value = '';
   await pollCreation(true);
   state.pollNew = setInterval(pollCreation, 2500);
 }
-async function pollCreation(force){
-  const box = document.getElementById('new-status');
+async function pollCreation(){
   let s;
   try { s = await api('/api/search/'+state.sid); } catch(e){ return; }
+  const box = document.getElementById('new-status');
+  const btn = document.getElementById('new-btn');
   if (s.status === 'PLANNING'){
     box.innerHTML = `<div class="card"><h3>🧠 Нейросеть собирает план…</h3>
       <p class="muted"><span class="spinner"></span> Запросы к нейросети встают в очередь (лимит ~63 сек) — это может занять пару минут.</p></div>`;
     return;
   }
   if (s.status === 'PLANNING_FAILED'){
+    btn.disabled = false;
     box.innerHTML = `<div class="card"><h3>😵 Не удалось собрать план</h3>
-      <button class="primary" onclick="sact(${s.id},'replan')">🔄 Попробовать снова</button></div>`;
-    if (state.pollNew) { clearInterval(state.pollNew); state.pollNew = null; }
-    loadSearches();
+      <div style="margin-top:10px"><button class="btn primary" onclick="replan(${s.id})">🔄 Попробовать снова</button></div></div>`;
+    stopPollers(); loadChips();
     return;
   }
-  if (s.status === 'ACTIVE' || s.status === 'PAUSED' || s.status === 'STOPPED'){
-    if (state.pollNew) { clearInterval(state.pollNew); state.pollNew = null; }
+  if (['ACTIVE','PAUSED','STOPPED'].includes(s.status)){
+    stopPollers(); btn.disabled = false;
     box.innerHTML = '';
     toast('🚀 Поиск запущен!');
+    loadChips();
     setTab('items');
-    loadSearches();
     return;
   }
   if (s.status === 'ASKING'){
-    if (state.pollNew) { clearInterval(state.pollNew); state.pollNew = null; }
-    await renderDialog(s);
+    stopPollers();
+    btn.disabled = false;
+    renderDialog(s);
   }
+}
+async function replan(sid){
+  await sact(sid, 'replan');
+  state.sid = sid;
+  pollCreation();
+  state.pollNew = setInterval(pollCreation, 2500);
 }
 async function renderDialog(s){
   const idx = (s.answers||[]).length;
@@ -599,14 +874,14 @@ async function renderDialog(s){
     return;
   }
   const q = qs[idx];
-  const btns = (q.options||[]).map((o,i)=>`<button class="item-btn" style="margin:3px" onclick="answer(${idx},${i})">${esc(o)}</button>`).join('');
   state.curQ = q;
+  const btns = (q.options||[]).map((o,i)=>`<button class="chip" style="margin:3px" onclick="answer(${idx},${i})">${esc(o)}</button>`).join(' ');
   box.innerHTML = `<div class="card">
     <h3>${esc(q.question)}</h3>
     ${answered}
-    <div style="margin:10px 0">${btns}</div>
+    <div class="chips" style="position:static;background:none;padding:10px 0 0">${btns}</div>
     <input id="free-ans" placeholder="Или напиши свой вариант и нажми Enter" onkeydown="if(event.key==='Enter')freeAnswer(${idx})">
-    <div style="margin-top:10px"><button class="item-btn" onclick="skipDialog()">Пропустить остальные</button></div>
+    <div style="margin-top:10px"><button class="btn ghost" onclick="skipDialog()">Пропустить остальные</button></div>
   </div>`;
 }
 async function answer(idx, optI){
@@ -659,6 +934,8 @@ def build_app() -> web.Application:
     app.router.add_post("/api/search", api_search_create)
     app.router.add_post("/api/search/{sid}/answer", api_search_answer)
     app.router.add_post("/api/search/{sid}/skip", api_search_skip)
+    app.router.add_get("/api/compare", api_compare_status)
+    app.router.add_post("/api/compare", api_compare_start)
     app.router.add_post("/api/searches/{sid}/{action}", api_search_action)
     return app
 

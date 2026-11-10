@@ -416,3 +416,59 @@ async def verify_items(tasks: list) -> list:
             "tips": str(r.get("tips", "")),
         })
     return rows
+
+
+# --------------------------------------------------------------- сравнение вариантов
+
+COMPARE_SYSTEM = """Ты — опытный помощник покупателя на Авито. Даны карточки товаров: название, цена (в рублях), характеристики с Авито и описание. Возможно, пользователь написал, что для него важнее.
+
+Задача: честно сравнить варианты и сказать, какой лучше ДЛЯ ЦЕЛЕЙ ЭТОГО ПОКУПАТЕЛЯ. Учитывай состояние, комплектацию, характеристики и цену вместе, а не только цену.
+
+Верни СТРОГО JSON:
+{
+  "summary": "краткий вывод в 2-3 предложениях",
+  "winner": <индекс лучшего варианта, отсчёт с 0>,
+  "why": "подробное объяснение, почему этот вариант лучше, со ссылками на конкретные характеристики",
+  "details": ["вариант 1 (наименование): сильные стороны / слабые стороны", ...],
+  "tips": "что проверить у продавца перед покупкой, 3-5 пунктов"
+}
+
+Правила:
+- Если каких-то критичных характеристик не хватает, прямо скажи об этом в why и выведи в tips.
+- details: один элемент на каждый вариант, в порядке массива cards.
+- НЕ используй двойные кавычки " и апострофы ' внутри значений полей — это ломает JSON."""
+
+
+async def compare_items(cards: list, note: str = "") -> dict | None:
+    """cards: [{"title", "price", "params": [...], "description"}] — вердикт «какой лучше»."""
+    payload = []
+    for i, c in enumerate(cards):
+        payload.append({
+            "index": i,
+            "title": c.get("title", ""),
+            "price": c.get("price"),
+            "params": c.get("params") or [],
+            "description": (c.get("description") or "")[:1500],
+        })
+    prompt = (
+        f"{COMPARE_SYSTEM}\n\n"
+        f"Что важно пользователю: {note or 'не указано'}\n\n"
+        f"Данные:\n{json.dumps(payload, ensure_ascii=False, indent=1)}"
+    )
+    try:
+        text = await _beatapi(prompt, "compare")
+    except Exception as e:
+        log.info("Ошибка compare_items: %s", e)
+        return None
+    parsed = _extract_json(text)
+    if not isinstance(parsed, dict):
+        return None
+    out = {
+        "summary": str(parsed.get("summary", "")),
+        "why": str(parsed.get("why", "")),
+        "winner": parsed.get("winner") if isinstance(parsed.get("winner"), int) else 0,
+        "details": [str(x) for x in parsed.get("details", []) if isinstance(x, str)],
+        "tips": str(parsed.get("tips", "")),
+    }
+    out["winner"] = max(0, min(out["winner"], len(payload) - 1))
+    return out

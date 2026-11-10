@@ -4,6 +4,7 @@
 """
 import asyncio
 import logging
+import os
 import platform
 import random
 import re
@@ -69,21 +70,6 @@ def build_url(city: str, slug: str | None, query: str, pmin, pmax, page: int, de
     if page > 1:
         params["p"] = str(page)
     return base + "?" + urllib.parse.urlencode(params)
-
-
-async def open_browser_context():
-    from playwright.async_api import async_playwright
-
-    pw = await async_playwright().start()
-    browser = await pw.chromium.launch(
-        executable_path=EDGE_PATH,
-        headless=appconfig.cfg("headless", False),
-        args=["--disable-blink-features=AutomationControlled"],
-    )
-    context = await browser.new_context(locale="ru-RU")
-    page = await context.new_page()
-    await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-    return pw, browser, page
 
 
 async def close_browser_context(pw, browser):

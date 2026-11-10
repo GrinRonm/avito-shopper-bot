@@ -412,6 +412,16 @@ def get_search_for_user(sid: int, chat_id: int) -> dict | None:
     return s
 
 
+def get_item_full(sid: int, avito_id: str) -> dict | None:
+    conn = _conn()
+    row = conn.execute(
+        WEB_ITEM_SELECT + " WHERE i.search_id = ? AND i.avito_id = ?",
+        (sid, str(avito_id)),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
 # ---------- коды входа на сайт ----------
 
 def create_auth_code(chat_id: int, ttl_minutes: int = 10) -> str:
