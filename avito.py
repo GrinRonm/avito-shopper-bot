@@ -28,13 +28,29 @@ async def open_browser_context():
     from playwright.async_api import async_playwright
 
     is_windows = platform.system() == "Windows"
-    headless = appconfig.cfg("headless", not is_windows)
+    if is_windows:
+        headless = appconfig.cfg("headless", False)  # на винде можно с окном (Edge)
+    else:
+        headless = True  # на сервере весь экрана нет — всегда headless
     executable = _browser_executable()
 
     pw = await async_playwright().start()
     kwargs = {"headless": headless, "args": ["--disable-blink-features=AutomationControlled"]}
+    if not is_windows:
+        kwargs["args"] += ["--no-sandbox", "--disable-dev-shm-usage"]  # root в Docker/VPS
     if executable:
         kwargs["executable_path"] = executable
+
+    # прокси для обхода бана датацентровых IP (в config.json: proxy_url)
+    proxy_url = str(appconfig.cfg("proxy_url", "") or "").strip()
+    if proxy_url:
+        proxy = {"server": proxy_url}
+        login = str(appconfig.cfg("proxy_login", "") or "").strip()
+        if login:
+            proxy["username"] = login
+            proxy["password"] = str(appconfig.cfg("proxy_password", "") or "")
+        kwargs["proxy"] = proxy
+        log.info("Браузер через прокси: %s", proxy_url)
 
     browser = await pw.chromium.launch(**kwargs)
     context = await browser.new_context(locale="ru-RU")
