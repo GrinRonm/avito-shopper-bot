@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+venv/
+shopper.db
+shopper.db-wal
+shopper.db-shm
+bot.log
+bot.out
+config.json
+_debug*
+regen_search1.py
+*.tmp

@@ -1,0 +1,18 @@
+{
+  "telegram_bot_token": "ВСТАВЬ_ТОКЕН_БОТА_ОТ_@BotFather",
+  "allowed_chat_ids": [123456789],
+  "beatapi_url": "https://direct.beatapi.io/v1/responses",
+  "beatapi_key": "ВСТАВЬ_КЛЮЧ_BeatAPI",
+  "beatapi_model": "deepseek-v4.1-flash-free",
+  "edge_path": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+  "headless": false,
+  "check_interval_seconds": 120,
+  "pages_first_pass": 3,
+  "pages_regular": 1,
+  "max_items_to_screen_per_search": 12,
+  "max_card_inspections_per_cycle": 4,
+  "max_notifications_per_cycle": 5,
+  "notify_close_matches": true,
+  "default_city_slugs": ["novokuznetsk"],
+  "web_port": 8080
+}
