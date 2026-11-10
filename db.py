@@ -549,6 +549,22 @@ def set_card_request_status(sid: int, avito_id: str, status: str):
     conn.close()
 
 
+def list_card_queue_web(limit: int = 50) -> list[dict]:
+    """Очередь карточек для админки: кто запросил, статус, время."""
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT q.search_id, q.avito_id, q.status, q.requested_at, "
+        "       i.title, i.price, s.chat_id, s.title AS search_title "
+        "FROM card_queue q "
+        "LEFT JOIN items i ON i.search_id = q.search_id AND i.avito_id = q.avito_id "
+        "LEFT JOIN searches s ON s.id = q.search_id "
+        "ORDER BY q.requested_at DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
 # ---------- коды входа на сайт ----------
 
 def create_auth_code(chat_id: int, ttl_minutes: int = 10) -> str:

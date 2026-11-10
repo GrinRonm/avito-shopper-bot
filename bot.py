@@ -11,6 +11,7 @@ import html
 import logging
 import os
 import sys
+import time
 
 # безопасный вывод на Windows-консоли
 if hasattr(sys.stdout, "reconfigure"):
@@ -581,9 +582,20 @@ async def run_scan(bot: Bot):
     log.info(f"🔎 Скан: {len(searches)} активных поисков")
     scraped: dict[int, list] = {}
     try:
+        import webapp
+        webapp.metric("scan", f"старт · {len(searches)} поиск(ов)")
+    except Exception:
+        pass
+    _t0 = time.time()
+    try:
         pw, browser, page = await asyncio.wait_for(avito.open_browser_context(), timeout=40)
     except Exception:
         log.exception("не удалось открыть браузер")
+        try:
+            import webapp
+            webapp.metric("scan", f"⛔ не открылся браузер · {time.time() - _t0:.1f} с")
+        except Exception:
+            pass
         return
     try:
         for s in searches:
@@ -599,6 +611,15 @@ async def run_scan(bot: Bot):
             await asyncio.wait_for(avito.close_browser_context(pw, browser), timeout=20)
         except Exception:
             log.exception("браузер не закрылся чисто")
+    try:
+        import webapp
+        webapp.metric("scan", f"готово · {sum(len(v) for v in scraped.values())} лотов",
+                      dur=time.time() - _t0)
+        if avito.pop_throttled():
+            webapp.metric("scan", "⛔ Авито душит IP")
+            webapp.metric("scan_throttle", "показана заглушка")
+    except Exception:
+        pass
 
     # 1) скрининг заголовков (1 вызов нейросети на весь цикл)
     tasks = [

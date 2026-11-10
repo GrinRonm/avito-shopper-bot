@@ -57,6 +57,31 @@ def session_chat_id(request) -> int | None:
     return verify_token(cookie) if cookie else None
 
 
+# ============================================================ метрики (для админки)
+
+_EVENTS: list[dict] = []          # кольцевой журнал запросов к Авито
+_METRIC_TS = {"scan_start": None, "card_start": None}
+
+
+def metric(kind: str, detail: str = "", dur: float | None = None):
+    """Событие запроса к Авито: scan/card/compare/throttle. Для админ-панели."""
+    ev = {
+        "ts": int(time.time()),
+        "kind": kind,
+        "detail": str(detail)[:90],
+        "dur": round(dur, 1) if dur is not None else None,
+    }
+    _EVENTS.append(ev)
+    if len(_EVENTS) > 300:
+        del _EVENTS[:150]
+    if kind == "scan_throttle":
+        _METRIC_TS["last_throttle"] = ev["ts"]
+
+
+def is_admin(request) -> bool:
+    return request["chat_id"] in set(appconfig.cfg("allowed_chat_ids", []))
+
+
 def require_auth(fn):
     async def wrapper(request):
         chat_id = session_chat_id(request)
@@ -254,6 +279,68 @@ async def api_item_card_request(request):
     return _json({"ok": True, "state": state, "position": db.queue_position(sid, iid)})
 
 
+# ============================================================ админка
+
+@require_auth
+async def api_admin(request):
+    """Сводка для админа: все поиски, очередь карточек, журнал запросов к Авито."""
+    if not is_admin(request):
+        return _json({"error": "forbidden"}, status=403)
+    searches = db.list_searches_web()
+    users = {u["chat_id"]: u.get("name") or "" for u in db.list_allowed_users()}
+    for s in searches:
+        s["owner"] = users.get(s.get("chat_id"), "")
+    now = int(time.time())
+    queue = db.list_card_queue_web()
+    return _json({
+        "now": now,
+        "searches": searches,
+        "queue": queue,
+        "events": list(reversed(_EVENTS[-120:])),
+        "cfg": {
+            "interval": appconfig.cfg("check_interval_seconds", 120),
+            "requests_per_cycle": appconfig.cfg("scan_requests_per_cycle", 1),
+            "card_cooldown": appconfig.cfg("card_fetch_cooldown_seconds", 180),
+            "proxy": appconfig.cfg("proxy_url", ""),
+        },
+    })
+
+
+@require_auth
+async def api_admin_search_action(request):
+    """Админ управляет чужими поисками: pause/resume/stop/delete."""
+    if not is_admin(request):
+        return _json({"ok": False, "error": "forbidden"}, status=403)
+    sid = int(request.match_info["sid"])
+    act = request.match_info["action"]
+    if not db.get_search(sid):
+        return _json({"ok": False, "error": "нет такого"}, status=404)
+    if act == "pause":
+        db.set_search_status(sid, "PAUSED")
+    elif act == "resume":
+        db.set_search_status(sid, "ACTIVE")
+    elif act == "stop":
+        db.set_search_status(sid, "STOPPED")
+    elif act == "delete":
+        db.delete_search(sid)
+    else:
+        return _json({"ok": False, "error": "unknown action"})
+    return _json({"ok": True})
+
+
+@require_auth
+async def api_admin_queue_clear(request):
+    """Очистить_DONE из очереди карточек (зачистка застрявших PROCESSING)."""
+    if not is_admin(request):
+        return _json({"ok": False, "error": "forbidden"}, status=403)
+    import sqlite3
+    conn = sqlite3.connect(db.DB_PATH)
+    conn.execute("UPDATE card_queue SET status='QUEUED' WHERE status='PROCESSING'")
+    conn.commit()
+    conn.close()
+    return _json({"ok": True})
+
+
 # ---------- воркер очереди карточек ----------
 
 async def _card_worker():
@@ -272,6 +359,7 @@ async def _card_worker():
         sid, iid, url = r["search_id"], r["avito_id"], r["url"]
         log.info("🃏 Воркер: снимаю карточку %s (поиск %s)", iid, sid)
         db.set_card_request_status(sid, iid, "PROCESSING")
+        _METRIC_TS["card_start"] = time.time()
         try:
             import avito
             pw, browser, page = await asyncio.wait_for(avito.open_browser_context(), timeout=40)
@@ -285,10 +373,12 @@ async def _card_worker():
             if info.get("description") or info.get("params") or info.get("photos"):
                 db.save_item_card(sid, iid, info)
                 db.set_card_request_status(sid, iid, "DONE")
+                metric("card", f"✅ {iid}", time.time() - _METRIC_TS["card_start"])
                 log.info("🃏 карточка %s снята (%s фото)", iid, len(info.get("photos") or []))
             else:
                 # Авито, скорее всего, показал заглушку — вернём в очередь
                 db.set_card_request_status(sid, iid, "QUEUED")
+                metric("card", f"⛔ {iid} (блок/пусто)", time.time() - _METRIC_TS["card_start"])
                 log.info("🃏 карточка %s не открылась — вернул в очередь", iid)
                 await asyncio.sleep(max(cooldown * 2, 300))
                 continue
@@ -595,6 +685,7 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
     <div class="tab" data-tab="searches" onclick="setTab('searches')"><span class="ic">🔍</span>Поиски</div>
     <div class="tab" data-tab="cmp" onclick="setTab('cmp')"><span class="ic">⚖️</span>Сравнение<span class="nub" id="cmp-nub">0</span></div>
     <div class="tab" data-tab="new" onclick="setTab('new')"><span class="ic">➕</span>Новый</div>
+    <div class="tab" data-tab="admin" onclick="setTab('admin')" style="display:none"><span class="ic">🛠</span>Админ</div>
   </nav>
 </header>
 
@@ -653,6 +744,13 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
       <div id="new-status"></div>
     </div>
   </div>
+
+  <div id="v-admin" style="display:none">
+    <div class="card" id="adr-tempo"></div>
+    <div class="card" id="adr-queue"></div>
+    <div class="card" id="adr-events"></div>
+    <div class="card" id="adr-searches"></div>
+  </div>
 </div>
 
 <div id="toast" class="toast"></div>
@@ -688,10 +786,11 @@ async function api(path, body, method){
 function stopPollers(){
   if (state.pollItems) { clearInterval(state.pollItems); state.pollItems = null; }
   if (state.pollNew) { clearInterval(state.pollNew); state.pollNew = null; }
+  if (state.pollAdmin) { clearInterval(state.pollAdmin); state.pollAdmin = null; }
 }
 function setTab(t){
   state.tab = t; stopPollers();
-  ['items','searches','cmp','new'].forEach(x=>{
+  ['items','searches','cmp','new','admin'].forEach(x=>{
     document.getElementById('v-'+x).style.display = x===t?'block':'none';
   });
   document.querySelectorAll('#nav .tab').forEach(el=>el.classList.toggle('on', el.dataset.tab===t));
@@ -699,6 +798,7 @@ function setTab(t){
   if (t==='searches') loadSearches();
   if (t==='cmp'){ renderCmp(); pollCompare(); }
   if (t==='new') document.getElementById('new-text').focus();
+  if (t==='admin'){ loadAdmin(); state.pollAdmin = setInterval(loadAdmin, 5000); }
   window.scrollTo(0,0);
 }
 
@@ -733,6 +833,8 @@ async function startApp(){
   document.getElementById('login').style.display='none';
   document.getElementById('app').style.display='block';
   document.getElementById('who').textContent = (me.name || '') + ' · ' + me.chat_id;
+  const adm = document.querySelector('#nav .tab[data-tab="admin"]');
+  if (adm) adm.style.display = me.is_owner ? '' : 'none';
   loadChips();
   setTab('items');
 }
@@ -860,6 +962,80 @@ async function requestCard(sid, iid){
     if (!document.getElementById('modal').classList.contains('open')) { clearInterval(state.pollCard); return; }
     openItem(sid, iid);
   }, 10000);
+}
+
+// ---------------- админка ----------------
+let ADMIN = null;
+function ago(ts, now){ const d = now - ts; if (d < 90) return d + ' с назад';
+  if (d < 5400) return Math.round(d/60) + ' мин назад';
+  if (d < 172800) return Math.round(d/3600) + ' ч назад';
+  return Math.round(d/86400) + ' дн назад'; }
+function fmtDur(d){ return d ? (d < 100 ? d.toFixed(1) + 'с' : Math.round(d) + 'с') : ''; }
+async function loadAdmin(){
+  let d;
+  try { d = await api('/api/admin'); } catch(e){ return; }
+  ADMIN = d;
+  // tempo (склад сервера)
+  document.getElementById('adr-tempo').innerHTML =
+    `<h3>🛠 Ритм бота</h3>
+     <p class="muted">интервал: <b>${d.cfg.interval}с</b> · запросов за цикл: <b>${d.cfg.requests_per_cycle}</b> ·
+     кулдаун карточек: <b>${d.cfg.card_cooldown}с</b></p>
+     <p class="muted" style="font-size:10px">${esc((d.cfg.proxy||'').replace(/^http:\/\/.*?@/, 'прокси: '))}</p>`;
+  // queue
+  const q = (d.queue||[]).map(x=>
+    `<div class="card" style="margin:6px 0;padding:8px 10px">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <span class="badge b-${x.status==='DONE'?'match':(x.status==='PROCESSING'?'rec':'nodata')}">${x.status}</span>
+        <b>${esc((x.title||'').slice(0,42))}</b>
+        <span class="muted">${rub(x.price)}</span>
+        <span class="muted">· поиск №${x.search_id} · ${ago(x.requested_at, d.now)}</span>
+      </div>
+    </div>`).join('') || '<p class="muted">Очередь пуста</p>';
+  document.getElementById('adr-queue').innerHTML =
+    `<h3>🃏 Очередь карточек (запросы с Авито)</h3>${q}`;
+  // events
+  const ev = (d.events||[]).map(e=>{
+    const ic = e.kind==='scan'?'🔄':(e.kind==='scan_throttle'?'⛔':(e.kind==='card'?'🃏':'⚖️'));
+    return `<div style="display:flex;gap:8px;padding:3px 0;font-size:12px;align-items:baseline;flex-wrap:wrap">
+      <span class="muted">${new Date(e.ts*1000).toLocaleTimeString('ru-RU')}</span>
+      <span>${ic}</span><span>${esc(e.detail)}</span>
+      ${e.dur?`<span class="muted">· ${fmtDur(e.dur)}</span>`:''}
+    </div>`;}).join('') || '<p class="muted">Пока тишина</p>';
+  document.getElementById('adr-events').innerHTML =
+    `<h3>⏱ Запросы к Авито (живой журнал)</h3>${ev}`;
+  // searches
+  const st = {ACTIVE:['✅ работает','b-match'], PAUSED:['⏸ на паузе','b-close'],
+              STOPPED:['⏹ остановлен','b-defect'], ASKING:['❓ опрашиваю','b-nodata'],
+              PLANNING:['🧠 планирую','b-nodata'], PLANNING_FAILED:['❌ ошибка плана','b-defect']};
+  const ss = (d.searches||[]).map(s=>{
+    const [label, cls] = st[s.status] || [s.status, 'b-nodata'];
+    const last = s.last_scan_at ? (d.now*1000 - Date.parse((s.last_scan_at+'Z').replace(' ','T'))) : null;
+    return `<div class="card" style="margin:8px 0;padding:10px 12px">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <span class="badge ${cls}">${label}</span>
+        <b>№${s.id}</b><span>${esc((s.title||'').slice(0,40))}</span>
+        <span class="muted">· ${esc(s.owner||'')} (${s.chat_id})</span>
+      </div>
+      <div style="display:flex;gap:10px;margin-top:5px;font-size:12px" class="muted">
+        <span>📦 лотов: <b style="color:var(--text)">${s.items_count}</b></span>
+        <span>✅ подошло: <b style="color:var(--text)">${s.matched_count}</b></span>
+        <span>🕓 ${last ? 'скан ' + ago(Math.round(last/1000), d.now) : 'ещё не сканился'}</span>
+      </div>
+      <div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap">
+        ${s.status==='ACTIVE'?'':`<button class="btn ghost sm" onclick="adminAct(${s.id},'resume')">▶ Старт</button>`}
+        ${s.status==='ACTIVE'?`<button class="btn ghost sm" onclick="adminAct(${s.id},'pause')">⏸ Пауза</button>`:''}
+        ${s.status!=='STOPPED'?`<button class="btn ghost sm" onclick="adminAct(${s.id},'stop')">⏹ Стоп</button>`:''}
+        <button class="btn ghost sm" style="color:var(--bad)" onclick="adminAct(${s.id},'delete')">🗑 Удалить</button>
+      </div>
+    </div>`;
+  }).join('') || '<p class="muted">Поисков нет</p>';
+  document.getElementById('adr-searches').innerHTML =
+    `<h3>📋 Все поиски пользователей</h3>${ss}`;
+}
+async function adminAct(sid, act){
+  if (act === 'delete' && !confirm('Удалить поиск №' + sid + ' со всеми лотами?')) return;
+  const r = await api(`/api/admin/search/${sid}/${act}`, {});
+  if (r.ok) { toast('✅ Готово'); loadAdmin(); } else toast(r.error || 'Ошибка', true);
 }
 function toggleFromModal(sid, iid){
   toggleCmp(sid, iid);
@@ -1179,6 +1355,9 @@ def build_app() -> web.Application:
     app.router.add_get("/api/compare", api_compare_status)
     app.router.add_post("/api/compare", api_compare_start)
     app.router.add_post("/api/searches/{sid}/{action}", api_search_action)
+    app.router.add_get("/api/admin", api_admin)
+    app.router.add_post("/api/admin/search/{sid}/{action}", api_admin_search_action)
+    app.router.add_post("/api/admin/queue/clear", api_admin_queue_clear)
     return app
 
 

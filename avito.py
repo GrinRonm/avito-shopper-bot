@@ -39,8 +39,15 @@ def _browser_executable():
     return None
 
 
+# Сериализация: все заходы бота (скан, воркер карточек, сравнение) — один
+# браузер за раз; cookie держатся на диске в постоянном профиле.
+_BROWSER_IO_LOCK = asyncio.Lock()
+_PROFILE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "browser_profile")
+
+
 async def open_browser_context():
-    """Patchright (невидимый Playwright) — если установлен, иначе обычный Playwright."""
+    """Браузер с постоянным профилем: cookie/история между заходами сохраняются,
+    — Авито видит «возвращающегося» пользователя, а не нового незнакомца каждые 5 минут."""
     try:
         from patchright.async_api import async_playwright  # антидетект-патченный
     except ImportError:
@@ -81,27 +88,45 @@ async def open_browser_context():
         log.info("Браузер через прокси: %s", proxy["server"])
         kwargs["proxy"] = proxy
 
-    browser = await pw.chromium.launch(**kwargs)
-    # реалистичный десктопный фингерпринт: UA настоящего Chrome в Windows,
-    # вместо палевного headless-агента (по нему Авито режет частоту в разы сильнее)
-    ua = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-    )
+    # десктопный фингерпринт: настоящий Windows-Chrome (вместо headless-агента)
     ctx_kwargs = {
         "locale": "ru-RU",
         "timezone_id": "Europe/Moscow",
-        "user_agent": ua,
+        "user_agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
+        ),
         "viewport": {"width": 1440, "height": 900},
         "screen": {"width": 1920, "height": 1080},
         "device_scale_factor": 1,
         "is_mobile": False,
         "has_touch": False,
     }
+
+    # постоянный профиль: cookie остаются на диске между заходами —
+    # Авито видит «возвращающегося» пользователя, а не нового незнакомца
+    use_profile = bool(appconfig.cfg("browser_profile", True)) and not is_windows
+    if use_profile:
+        await _BROWSER_IO_LOCK.acquire()
+        try:
+            context = await pw.chromium.launch_persistent_context(
+                _PROFILE_DIR, **kwargs, **ctx_kwargs)
+        except Exception:
+            _BROWSER_IO_LOCK.release()
+            await pw.stop()
+            raise
+        log.info("Браузер: постоянный профиль (patchright)")
+        page = context.pages[0] if context.pages else await context.new_page()
+        await page.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        return pw, context, page
+
+    browser = await pw.chromium.launch(**kwargs)
     context = await browser.new_context(**ctx_kwargs)
     page = await context.new_page()
-    await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-    return pw, browser, page
+    await page.add_init_script(
+        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+    return pw, browser, page, False
 
 # явный брак/мусор, отсекаем без нейросети (по тексту карточки)
 LOCAL_DEFECT_KEYWORDS = [
@@ -137,7 +162,12 @@ async def close_browser_context(pw, browser):
     try:
         await browser.close()
     finally:
-        await pw.stop()
+        try:
+            await pw.stop()
+        finally:
+            # постоянный профиль держал IO-лок
+            if _BROWSER_IO_LOCK.locked():
+                _BROWSER_IO_LOCK.release()
 
 
 def _item_id_from_href(href: str) -> str:
