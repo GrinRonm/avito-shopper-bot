@@ -293,7 +293,10 @@ async def _do_compare(chat_id: int, rows: list, note: str):
                         "description": info.get("description") or r["snippet"] or "",
                     })
             finally:
-                await avito.close_browser_context(pw, browser)
+                try:
+                    await asyncio.wait_for(avito.close_browser_context(pw, browser), timeout=20)
+                except Exception:
+                    log.exception("браузер сравнения не закрылся чисто")
 
         verdict = await ai_client.compare_items(cards, note)
         if not verdict:

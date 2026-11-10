@@ -580,18 +580,25 @@ async def run_scan(bot: Bot):
 
     log.info(f"🔎 Скан: {len(searches)} активных поисков")
     scraped: dict[int, list] = {}
-    pw, browser, page = await avito.open_browser_context()
+    try:
+        pw, browser, page = await asyncio.wait_for(avito.open_browser_context(), timeout=40)
+    except Exception:
+        log.exception("не удалось открыть браузер")
+        return
     try:
         for s in searches:
             s["_first_pass"] = s["last_scan_at"] is None
             try:
-                scraped[s["id"]] = await avito.scan_listing(page, s)
+                scraped[s["id"]] = await asyncio.wait_for(avito.scan_listing(page, s), timeout=600)
                 db.mark_scanned(s["id"])
             except Exception:
                 log.exception("scan error for search %s", s["id"])
                 scraped[s["id"]] = []
     finally:
-        await avito.close_browser_context(pw, browser)
+        try:
+            await asyncio.wait_for(avito.close_browser_context(pw, browser), timeout=20)
+        except Exception:
+            log.exception("браузер не закрылся чисто")
 
     # 1) скрининг заголовков (1 вызов нейросети на весь цикл)
     tasks = [
