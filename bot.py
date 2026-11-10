@@ -742,6 +742,15 @@ async def scan_loop(bot: Bot):
                 pass
             _wake.clear()
             await run_scan(bot)
+            if avito.pop_throttled():
+                # Avito режет IP: не дёргаем его по расписанию, ставим паузу побольше,
+                # так бан спадает быстрее (серия: 600с, 900с, 1200с... максимум ~25 мин)
+                scan_loop._streak = getattr(scan_loop, "_streak", 0) + 1
+                extra = min(300 + scan_loop._streak * 300, 1500)
+                log.info("⏳ Пауза дополнительно %s сек — даём IP передышку", extra)
+                await asyncio.sleep(extra)
+            else:
+                scan_loop._streak = 0
         except asyncio.CancelledError:
             raise
         except Exception:

@@ -17,6 +17,17 @@ log = logging.getLogger("avito")
 # ротация поисковых фраз между скан-циклами (search_id -> счётчик циклов)
 _RR: dict[int, int] = {}
 
+# флаг «Avito душит IP» последнего цикла (см. pop_throttled)
+_THROTTLED = False
+
+
+def pop_throttled() -> bool:
+    """Вернуть и сбросить флаг троттлинга последнего скан-цикла."""
+    global _THROTTLED
+    v = _THROTTLED
+    _THROTTLED = False
+    return v
+
 
 def _browser_executable():
     """Windows -> Edge (человек видит окно, антибот дружелюбнее).
@@ -217,6 +228,8 @@ async def scan_listing(page, search: dict) -> list:
         if ("доступ ограничен" in t or "проблема с ip" in t
                 or "не загрузилась" in t):
             log.info("   ⛔ Avito душит IP — в этом цикле прошёл только частичный заход; досканим в следующий")
+            global _THROTTLED
+            _THROTTLED = True
             throttled = True
             return True  # страница открылась, но это заглушка
         return True
