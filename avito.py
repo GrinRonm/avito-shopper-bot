@@ -46,17 +46,50 @@ async def _blocked(page) -> bool:
     return any(m in t for m in _BLOCK_MARKS)
 
 
+async def _try_pass_check(page) -> bool:
+    """На странице «Доступ ограничен» есть кнопка «Пройти проверку» —
+    жмём её, как сделал бы человек (запускается проверка браузера)."""
+    btn = None
+    for sel in ('button:has-text("Пройти проверку")',
+                'a:has-text("Пройти проверку")',
+                'button:has-text("проверку")'):
+        try:
+            btn = await page.query_selector(sel)
+        except Exception:
+            btn = None
+        if btn:
+            break
+    if not btn:
+        return False
+    try:
+        await btn.click()
+        log.info("   🖱 нажал «Пройти проверку»")
+        return True
+    except Exception:
+        return False
+
+
 async def wait_out_challenge(page, extra_reloads: int = 2, poll_rounds: int = 6) -> bool:
     """Avito на заходе показывает «проверку подключения» 5-10 секунд,
-    потом сам дотягивает контент. Ждём (поллинг) и при необходимости
-    перезагружаем — вместо того чтобы сразу сдаваться и считать это баном IP.
+    потом сам дотягивает контент. Ждём, жмём «Пройти проверку», при
+    необходимости перезагружаем — вместо того чтобы сразу сдаваться.
 
     True — контент дождались; False — так и осталась заглушка."""
+    clicked = False
     for attempt in range(extra_reloads + 1):
         for _ in range(poll_rounds):
             if not await _blocked(page):
                 return True
             await asyncio.sleep(2)
+        if not clicked:
+            # на заглушке есть кнопка — нажимаем и даём проверке дойти
+            clicked = await _try_pass_check(page)
+            if clicked:
+                for _ in range(poll_rounds):
+                    if not await _blocked(page):
+                        return True
+                    await asyncio.sleep(2)
+                continue
         if attempt < extra_reloads:
             log.info("   ⏳ проверка подключения висит — перезагружаю (%s/%s)",
                      attempt + 1, extra_reloads)
