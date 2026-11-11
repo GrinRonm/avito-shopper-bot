@@ -29,6 +29,44 @@ def pop_throttled() -> bool:
     return v
 
 
+def is_throttled() -> bool:
+    """Текущее состояние «Avito душит IP» (без сброса) — для воркера карточек."""
+    return _THROTTLED
+
+
+_BLOCK_MARKS = ("доступ ограничен", "проблема с ip", "не загрузилась")
+
+
+async def _blocked(page) -> bool:
+    """Открыта ли страница-заглушка «доступ ограничен»."""
+    try:
+        t = (await page.title()).lower()
+    except Exception:
+        return False
+    return any(m in t for m in _BLOCK_MARKS)
+
+
+async def wait_out_challenge(page, extra_reloads: int = 2, poll_rounds: int = 6) -> bool:
+    """Avito на заходе показывает «проверку подключения» 5-10 секунд,
+    потом сам дотягивает контент. Ждём (поллинг) и при необходимости
+    перезагружаем — вместо того чтобы сразу сдаваться и считать это баном IP.
+
+    True — контент дождались; False — так и осталась заглушка."""
+    for attempt in range(extra_reloads + 1):
+        for _ in range(poll_rounds):
+            if not await _blocked(page):
+                return True
+            await asyncio.sleep(2)
+        if attempt < extra_reloads:
+            log.info("   ⏳ проверка подключения висит — перезагружаю (%s/%s)",
+                     attempt + 1, extra_reloads)
+            try:
+                await page.reload(wait_until="domcontentloaded", timeout=25000)
+            except Exception:
+                pass
+    return not await _blocked(page)
+
+
 def _browser_executable():
     """Windows -> Edge (человек видит окно, антибот дружелюбнее).
     Linux/сервер -> ничего: patchright/playwright сами находят родную сборку
@@ -252,13 +290,17 @@ async def scan_listing(page, search: dict) -> list:
             t = (await page.title()).lower()
         except Exception:
             t = ""
-        if ("доступ ограничен" in t or "проблема с ip" in t
-                or "не загрузилась" in t):
-            log.info("   ⛔ Avito душит IP — в этом цикле прошёл только частичный заход; досканим в следующий")
-            global _THROTTLED
-            _THROTTLED = True
-            throttled = True
-            return True  # страница открылась, но это заглушка
+        if any(m in t for m in _BLOCK_MARKS):
+            # это может быть временная «проверка подключения» — ждём, как дома
+            log.info("   ⏳ проверка подключения — ждём…")
+            if await wait_out_challenge(page, extra_reloads=4, poll_rounds=8):
+                log.info("   ✅ проверка прошла, контент открылся")
+            else:
+                log.info("   ⛔ Avito душит IP — в этом цикле прошёл только частичный заход; досканим в следующий")
+                global _THROTTLED
+                _THROTTLED = True
+                throttled = True
+                return True  # страница открылась, но это заглушка
         return True
 
     for city in cities:
@@ -328,14 +370,13 @@ async def inspect_item(page, url: str = None):
     for attempt in (1, 2):
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=25000)
-            # Авито на всякий случай: страница-заглушка «доступ ограничен»
-            try:
-                t = (await page.title()).lower()
-            except Exception:
-                t = ""
-            if "доступ ограничен" in t or "проблема с ip" in t:
-                log.info("   ⛔ карточка не открылась: Avito ограничил IP")
-                return out
+            # Авито: сначала может быть «проверка подключения» 5-10с или
+            # страница-заглушка «доступ ограничен» — ждём, потом сдаёмся
+            if await _blocked(page):
+                log.info("   ⏳ карточка: проверка подключения — ждём…")
+                if not await wait_out_challenge(page):
+                    log.info("   ⛔ карточка не открылась: Avito ограничил IP")
+                    return out
             # ждём, пока дорисуются характеристики или описание
             got_params = await page.wait_for_selector(
                 'div[data-marker="item-view/item-params"] li', timeout=10000)

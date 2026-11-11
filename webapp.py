@@ -346,7 +346,16 @@ async def api_admin_queue_clear(request):
 async def _card_worker():
     """Фон: снимает карточки из очереди (Аккуратно к IP — между заходами пауза)."""
     cooldown = int(appconfig.cfg("card_fetch_cooldown_seconds", 180))
+    fails = 0  # подряд неуспешных снятий — для растущего бэкоффа
     while True:
+        try:
+            import avito
+            if avito.is_throttled():
+                # Авито душит IP — не долбим карточки, даём передышку
+                await asyncio.sleep(60)
+                continue
+        except Exception:
+            pass
         try:
             batch = db.pop_card_requests(1)
         except Exception:
@@ -364,7 +373,7 @@ async def _card_worker():
             import avito
             pw, browser, page = await asyncio.wait_for(avito.open_browser_context(), timeout=40)
             try:
-                info = await asyncio.wait_for(avito.inspect_item(page, url), timeout=150)
+                info = await asyncio.wait_for(avito.inspect_item(page, url), timeout=200)
             finally:
                 try:
                     await asyncio.wait_for(avito.close_browser_context(pw, browser), timeout=20)
@@ -375,12 +384,14 @@ async def _card_worker():
                 db.set_card_request_status(sid, iid, "DONE")
                 metric("card", f"✅ {iid}", time.time() - _METRIC_TS["card_start"])
                 log.info("🃏 карточка %s снята (%s фото)", iid, len(info.get("photos") or []))
+                fails = 0
             else:
                 # Авито, скорее всего, показал заглушку — вернём в очередь
                 db.set_card_request_status(sid, iid, "QUEUED")
                 metric("card", f"⛔ {iid} (блок/пусто)", time.time() - _METRIC_TS["card_start"])
                 log.info("🃏 карточка %s не открылась — вернул в очередь", iid)
-                await asyncio.sleep(max(cooldown * 2, 300))
+                fails += 1
+                await asyncio.sleep(min(cooldown * (2 ** fails), 1800))
                 continue
         except Exception:
             log.exception("card worker failed for %s", iid)
