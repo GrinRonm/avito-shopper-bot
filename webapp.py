@@ -7,6 +7,7 @@
 import asyncio
 import hashlib
 import hmac
+import html as _html
 import json
 import logging
 import time
@@ -60,7 +61,41 @@ def session_chat_id(request) -> int | None:
 # ============================================================ метрики (для админки)
 
 _EVENTS: list[dict] = []          # кольцевой журнал запросов к Авито
+AI_LOG: list[dict] = []           # кольцевой журнал запросов/ответов нейросети
+BOT = None                        # ссылку ставит bot.py в main()
 _METRIC_TS = {"scan_start": None, "card_start": None}
+
+
+def _get_bot():
+    """Экземпляр Telegram-бота (для уведомлений из админки)."""
+    if BOT is not None:
+        return BOT
+    try:
+        import bot as _botmod
+        return _botmod.BOT
+    except Exception:
+        return None
+
+
+def ai_log(tag: str, prompt: str, response: str = "", dur: float | None = None, err: str = ""):
+    """Полный лог общения с нейросетью — для вкладки «Нейросеть» в админке."""
+    AI_LOG.append({
+        "ts": int(time.time()),
+        "tag": tag,
+        "prompt": str(prompt or "")[:6000],
+        "response": str(response or "")[:6000],
+        "dur": round(dur, 1) if dur is not None else None,
+        "err": str(err)[:300],
+    })
+    if len(AI_LOG) > 150:
+        del AI_LOG[:60]
+
+
+def _sqlite():
+    import sqlite3
+    conn = sqlite3.connect(db.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def metric(kind: str, detail: str = "", dur: float | None = None):
@@ -283,7 +318,7 @@ async def api_item_card_request(request):
 
 @require_auth
 async def api_admin(request):
-    """Сводка для админа: все поиски, очередь карточек, журнал запросов к Авито."""
+    """Сводка для админа: все поиски, очередь карточек, журналы Авито и нейросети."""
     if not is_admin(request):
         return _json({"error": "forbidden"}, status=403)
     searches = db.list_searches_web()
@@ -296,25 +331,58 @@ async def api_admin(request):
         "now": now,
         "searches": searches,
         "queue": queue,
-        "events": list(reversed(_EVENTS[-120:])),
+        "events": list(reversed(_EVENTS[-150:])),
+        "ai_log": list(reversed(AI_LOG[-60:])),
         "cfg": {
             "interval": appconfig.cfg("check_interval_seconds", 120),
             "requests_per_cycle": appconfig.cfg("scan_requests_per_cycle", 1),
             "card_cooldown": appconfig.cfg("card_fetch_cooldown_seconds", 180),
+            "auto_stop_matched": appconfig.cfg("auto_stop_matched", 0),
+            "auto_stop_hours": appconfig.cfg("auto_stop_hours", 0),
             "proxy": appconfig.cfg("proxy_url", ""),
         },
     })
 
 
+_VERB = {"pause": "поставил на паузу", "resume": "запустил",
+         "stop": "остановил", "delete": "удалил"}
+
+
+async def _notify_search_owner(sid: int, act: str, extra: str = ""):
+    """TG-уведомление владельцу поиска о действии админа."""
+    try:
+        b = _get_bot()
+        if not b:
+            log.warning("уведомление владельцу %s не отправлено: бот не найден", sid)
+            return
+        s = db.get_search(sid)
+        if not s:
+            return
+        text = (f"🛠 <b>Администратор</b> {_VERB.get(act, act)} твой поиск "
+                f"№{sid} «{_html.escape(s['title'] or 'Без названия')}»")
+        if extra:
+            text += f"\n\n💬 {extra}"
+        await b.send_message(s["chat_id"], text)
+    except Exception:
+        log.exception("не удалось уведомить владельца поиска %s", sid)
+
+
 @require_auth
 async def api_admin_search_action(request):
-    """Админ управляет чужими поисками: pause/resume/stop/delete."""
+    """Админ управляет чужими поисками: pause/resume/stop/delete (+сообщение владельцу)."""
     if not is_admin(request):
         return _json({"ok": False, "error": "forbidden"}, status=403)
     sid = int(request.match_info["sid"])
     act = request.match_info["action"]
-    if not db.get_search(sid):
+    s = db.get_search(sid)
+    if not s:
         return _json({"ok": False, "error": "нет такого"}, status=404)
+    note = ""
+    try:
+        body = await request.json()
+        note = str((body or {}).get("message") or "").strip()[:500]
+    except Exception:
+        pass
     if act == "pause":
         db.set_search_status(sid, "PAUSED")
     elif act == "resume":
@@ -322,19 +390,122 @@ async def api_admin_search_action(request):
     elif act == "stop":
         db.set_search_status(sid, "STOPPED")
     elif act == "delete":
+        await _notify_search_owner(sid, act, note)
         db.delete_search(sid)
+        return _json({"ok": True})
     else:
         return _json({"ok": False, "error": "unknown action"})
+    await _notify_search_owner(sid, act, note)
+    metric("admin", f"{act} поиск №{sid} ({s.get('title') or ''})")
     return _json({"ok": True})
 
 
 @require_auth
-async def api_admin_queue_clear(request):
-    """Очистить_DONE из очереди карточек (зачистка застрявших PROCESSING)."""
+async def api_admin_message(request):
+    """Отправить произвольное сообщение пользователю от админа."""
     if not is_admin(request):
         return _json({"ok": False, "error": "forbidden"}, status=403)
-    import sqlite3
-    conn = sqlite3.connect(db.DB_PATH)
+    try:
+        body = await request.json()
+        chat_id = int(body.get("chat_id"))
+        text = str(body.get("text") or "").strip()[:2000]
+    except Exception:
+        return _json({"ok": False, "error": "нужны chat_id и text"})
+    if not text:
+        return _json({"ok": False, "error": "пустой текст"})
+    try:
+        b = _get_bot()
+        if not b:
+            return _json({"ok": False, "error": "бот ещё не запущен"})
+        await b.send_message(chat_id, f"🛠 <b>Сообщение от администратора</b>\n\n{_html.escape(text)}")
+    except Exception as ex:
+        return _json({"ok": False, "error": str(ex)[:200]})
+    metric("admin", f"сообщение → {chat_id}")
+    return _json({"ok": True})
+
+
+@require_auth
+async def api_admin_search_items(request):
+    """Лоты конкретного поиска: что нашлось и что сказала нейросеть."""
+    if not is_admin(request):
+        return _json({"error": "forbidden"}, status=403)
+    sid = int(request.match_info["sid"])
+    conn = _sqlite()
+    rows = conn.execute(
+        "SELECT avito_id, title, price, url, snippet, status, verdict, reason, "
+        "       (card_json IS NOT NULL AND card_json != '') AS has_card, notified, created_at "
+        "FROM items WHERE search_id = ? ORDER BY rowid DESC LIMIT 300",
+        (sid,)).fetchall()
+    conn.close()
+    return _json({"items": [dict(r) for r in rows]})
+
+
+@require_auth
+async def api_admin_item_card(request):
+    """Карточка лота: описание, характеристики, фото, вердикт нейросети."""
+    if not is_admin(request):
+        return _json({"error": "forbidden"}, status=403)
+    sid = int(request.match_info["sid"])
+    iid = str(request.match_info["iid"])
+    card = db.get_item_card(sid, iid) or {}
+    conn = _sqlite()
+    row = conn.execute(
+        "SELECT verdict, reason, ai_json FROM items WHERE search_id = ? AND avito_id = ?",
+        (sid, iid)).fetchone()
+    conn.close()
+    ai_json = {}
+    if row and row["ai_json"]:
+        try:
+            ai_json = json.loads(row["ai_json"])
+        except Exception:
+            pass
+    return _json({
+        "card": card,
+        "verdict": row["verdict"] if row else "",
+        "reason": row["reason"] if row else "",
+        "ai_json": ai_json,
+    })
+
+
+@require_auth
+async def api_admin_config(request):
+    """Обновить настройки бота (интервал, лимиты авто-остановки и пр.)."""
+    if not is_admin(request):
+        return _json({"ok": False, "error": "forbidden"}, status=403)
+    try:
+        body = await request.json()
+    except Exception:
+        return _json({"ok": False, "error": "нет JSON"})
+    keymap = {
+        "interval": "check_interval_seconds",
+        "requests_per_cycle": "scan_requests_per_cycle",
+        "card_cooldown": "card_fetch_cooldown_seconds",
+        "auto_stop_matched": "auto_stop_matched",
+        "auto_stop_hours": "auto_stop_hours",
+    }
+    changed = []
+    for k, v in (body or {}).items():
+        if k not in keymap:
+            continue
+        try:
+            val = int(v)
+        except Exception:
+            continue
+        if val < 0:
+            continue
+        appconfig.set_cfg(keymap[k], val)
+        changed.append(f"{keymap[k]}={val}")
+    if changed:
+        metric("admin", "настройки: " + ", ".join(changed))
+    return _json({"ok": True, "changed": changed})
+
+
+@require_auth
+async def api_admin_queue_clear(request):
+    """Вернуть застрявшие PROCESSING в очередь."""
+    if not is_admin(request):
+        return _json({"ok": False, "error": "forbidden"}, status=403)
+    conn = _sqlite()
     conn.execute("UPDATE card_queue SET status='QUEUED' WHERE status='PROCESSING'")
     conn.commit()
     conn.close()
@@ -584,6 +755,18 @@ section h3{margin:2px 0 0;font-size:16px;font-weight:800}
 .b-close{background:var(--warn)}
 .b-reject{background:var(--bad);color:#fff}
 .b-nodata{background:#3a4454;color:#c6cfe0} .b-defect{background:#3a4454;color:#c6cfe0}
+  .adm-menu{display:flex;gap:6px;flex-wrap:wrap;margin:2px 0 12px}
+  .adm-tab{border:1px solid var(--line);background:var(--panel2);border-radius:20px;
+    padding:8px 14px;font-size:13px;font-weight:650;color:var(--muted);cursor:pointer;transition:.15s}
+  .adm-tab.on{background:var(--grad);color:#05231a;border-color:transparent}
+  .adm-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:9px 0;border-bottom:1px solid var(--line)}
+  .adm-row:last-child{border-bottom:0}
+  details.adm-d{margin:6px 0;border:1px solid var(--line);border-radius:10px;padding:8px 10px;background:var(--panel)}
+  details.adm-d summary{cursor:pointer;font-size:12px;color:var(--muted)}
+  .adm-pre{white-space:pre-wrap;font-size:11.5px;background:var(--panel3);border-radius:8px;
+    padding:8px;max-height:260px;overflow:auto;margin-top:6px;color:#cbd5e1}
+  .adm-in{width:90px;background:var(--panel3);border:1px solid var(--line);border-radius:8px;
+    color:var(--text);padding:7px 9px;font-size:13px}
 .b-active{background:var(--accent2)} .b-paused{background:var(--warn)} .b-stopped{background:var(--bad);color:#fff}
 .b-asking{background:#8ab4ff} .b-planning{background:var(--violet)}
 .acts{display:flex;gap:6px;flex-shrink:0}
@@ -757,10 +940,35 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
   </div>
 
   <div id="v-admin" style="display:none">
-    <div class="card" id="adr-tempo"></div>
-    <div class="card" id="adr-queue"></div>
-    <div class="card" id="adr-events"></div>
-    <div class="card" id="adr-searches"></div>
+    <div class="adm-menu">
+      <button class="adm-tab on" data-a="overview" onclick="admTab('overview')">📊 Обзор</button>
+      <button class="adm-tab" data-a="searches" onclick="admTab('searches')">📋 Поиски</button>
+      <button class="adm-tab" data-a="items" onclick="admTab('items')">📦 Товары</button>
+      <button class="adm-tab" data-a="queue" onclick="admTab('queue')">🃏 Очередь</button>
+      <button class="adm-tab" data-a="avito" onclick="admTab('avito')">⏱ Журнал Авито</button>
+      <button class="adm-tab" data-a="ai" onclick="admTab('ai')">🧠 Нейросеть</button>
+      <button class="adm-tab" data-a="settings" onclick="admTab('settings')">⚙️ Настройки</button>
+    </div>
+    <div id="adm-overview">
+      <div class="card" id="adr-overview"></div>
+    </div>
+    <div id="adm-searches" style="display:none"></div>
+    <div id="adm-items" style="display:none">
+      <div class="chips" id="adm-item-chips"></div>
+      <div id="adm-item-list"></div>
+    </div>
+    <div id="adm-queue" style="display:none">
+      <div class="card" id="adr-queue"></div>
+    </div>
+    <div id="adm-avito" style="display:none">
+      <div class="card" id="adr-events"></div>
+    </div>
+    <div id="adm-ai" style="display:none">
+      <div class="card" id="adr-ai"></div>
+    </div>
+    <div id="adm-settings" style="display:none">
+      <div class="card" id="adr-settings"></div>
+    </div>
   </div>
 </div>
 
@@ -809,7 +1017,7 @@ function setTab(t){
   if (t==='searches') loadSearches();
   if (t==='cmp'){ renderCmp(); pollCompare(); }
   if (t==='new') document.getElementById('new-text').focus();
-  if (t==='admin'){ loadAdmin(); state.pollAdmin = setInterval(loadAdmin, 5000); }
+  if (t==='admin'){ admTab('overview'); state.pollAdmin = setInterval(loadAdmin, 5000); }
   window.scrollTo(0,0);
 }
 
@@ -977,49 +1185,54 @@ async function requestCard(sid, iid){
 
 // ---------------- админка ----------------
 let ADMIN = null;
+const ADM_SECTIONS = ['overview','searches','items','queue','avito','ai','settings'];
+let admTabId = 'overview';
+let admSearchId = null;
 function ago(ts, now){ const d = now - ts; if (d < 90) return d + ' с назад';
   if (d < 5400) return Math.round(d/60) + ' мин назад';
   if (d < 172800) return Math.round(d/3600) + ' ч назад';
   return Math.round(d/86400) + ' дн назад'; }
 function fmtDur(d){ return d ? (d < 100 ? d.toFixed(1) + 'с' : Math.round(d) + 'с') : ''; }
+function fmtTs(ts){ return new Date(ts*1000).toLocaleTimeString('ru-RU'); }
+function admTab(a){
+  admTabId = a;
+  ADM_SECTIONS.forEach(x=>{
+    const el = document.getElementById('adm-'+x); if (el) el.style.display = x===a?'block':'none';
+  });
+  document.querySelectorAll('.adm-tab').forEach(el=>el.classList.toggle('on', el.dataset.a===a));
+  loadAdmin();
+  if (a==='items') admLoadSearchChips();
+}
+const ADM_ST = {ACTIVE:['✅ работает','b-match'], PAUSED:['⏸ на паузе','b-close'],
+            STOPPED:['⏹ остановлен','b-defect'], ASKING:['❓ опрашиваю','b-nodata'],
+            PLANNING:['🧠 планирую','b-nodata'], PLANNING_FAILED:['❌ ошибка плана','b-defect']};
 async function loadAdmin(){
   let d;
   try { d = await api('/api/admin'); } catch(e){ return; }
   ADMIN = d;
-  // tempo (склад сервера)
-  document.getElementById('adr-tempo').innerHTML =
-    `<h3>🛠 Ритм бота</h3>
-     <p class="muted">интервал: <b>${d.cfg.interval}с</b> · запросов за цикл: <b>${d.cfg.requests_per_cycle}</b> ·
-     кулдаун карточек: <b>${d.cfg.card_cooldown}с</b></p>
-     <p class="muted" style="font-size:10px">${esc((d.cfg.proxy||'').replace(/^http:\/\/.*?@/, 'прокси: '))}</p>`;
-  // queue
-  const q = (d.queue||[]).map(x=>
-    `<div class="card" style="margin:6px 0;padding:8px 10px">
-      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-        <span class="badge b-${x.status==='DONE'?'match':(x.status==='PROCESSING'?'rec':'nodata')}">${x.status}</span>
-        <b>${esc((x.title||'').slice(0,42))}</b>
-        <span class="muted">${rub(x.price)}</span>
-        <span class="muted">· поиск №${x.search_id} · ${ago(x.requested_at, d.now)}</span>
-      </div>
-    </div>`).join('') || '<p class="muted">Очередь пуста</p>';
-  document.getElementById('adr-queue').innerHTML =
-    `<h3>🃏 Очередь карточек (запросы с Авито)</h3>${q}`;
-  // events
-  const ev = (d.events||[]).map(e=>{
-    const ic = e.kind==='scan'?'🔄':(e.kind==='scan_throttle'?'⛔':(e.kind==='card'?'🃏':'⚖️'));
-    return `<div style="display:flex;gap:8px;padding:3px 0;font-size:12px;align-items:baseline;flex-wrap:wrap">
-      <span class="muted">${new Date(e.ts*1000).toLocaleTimeString('ru-RU')}</span>
-      <span>${ic}</span><span>${esc(e.detail)}</span>
-      ${e.dur?`<span class="muted">· ${fmtDur(e.dur)}</span>`:''}
-    </div>`;}).join('') || '<p class="muted">Пока тишина</p>';
-  document.getElementById('adr-events').innerHTML =
-    `<h3>⏱ Запросы к Авито (живой журнал)</h3>${ev}`;
-  // searches
-  const st = {ACTIVE:['✅ работает','b-match'], PAUSED:['⏸ на паузе','b-close'],
-              STOPPED:['⏹ остановлен','b-defect'], ASKING:['❓ опрашиваю','b-nodata'],
-              PLANNING:['🧠 планирую','b-nodata'], PLANNING_FAILED:['❌ ошибка плана','b-defect']};
+  if (admTabId==='overview') rOverview(d);
+  if (admTabId==='searches') rSearches(d);
+  if (admTabId==='queue') rQueue(d);
+  if (admTabId==='avito') rAvito(d);
+  if (admTabId==='ai') rAI(d);
+  if (admTabId==='settings') rSettings(d);
+}
+function rOverview(d){
+  const act = (d.searches||[]).filter(s=>s.status==='ACTIVE').length;
+  const lastEv = (d.events||[])[0];
+  const lastAi = (d.ai_log||[])[0];
+  document.getElementById('adr-overview').innerHTML =
+    `<h3>🛠 Обзор</h3>
+     <div class="adm-row"><span>🔍 Активных поисков</span><b style="margin-left:auto">${act} / ${(d.searches||[]).length}</b></div>
+     <div class="adm-row"><span>⏱ Ритм</span><span class="muted" style="margin-left:auto">интервал ${d.cfg.interval}с · ${d.cfg.requests_per_cycle} зап./цикл · карточки ${d.cfg.card_cooldown}с</span></div>
+     <div class="adm-row"><span>🛑 Лимиты авто-стопа</span><span class="muted" style="margin-left:auto">${d.cfg.auto_stop_matched ? '✅ до '+d.cfg.auto_stop_matched+' подошедших' : 'нет'} · ${d.cfg.auto_stop_hours ? '⏰ до '+d.cfg.auto_stop_hours+' ч' : ''}</span></div>
+     <div class="adm-row"><span>🔄 Последнее к Авито</span><span class="muted" style="margin-left:auto">${lastEv ? esc(lastEv.detail) : '—'}${lastEv && lastEv.dur ? ' · '+fmtDur(lastEv.dur) : ''}</span></div>
+     <div class="adm-row"><span>🧠 Последнее к ИИ</span><span class="muted" style="margin-left:auto">${lastAi ? fmtTs(lastAi.ts) + ' · ' + lastAi.tag + (lastAi.err ? ' · ' + esc(lastAi.err) : ' · ' + fmtDur(lastAi.dur)) : '—'}</span></div>
+     <p class="muted" style="font-size:10.5px;margin:6px 0 0">${esc((d.cfg.proxy||'').replace(/^https?:\/\/.*?@/, 'прокси: '))}</p>`;
+}
+function rSearches(d){
   const ss = (d.searches||[]).map(s=>{
-    const [label, cls] = st[s.status] || [s.status, 'b-nodata'];
+    const [label, cls] = ADM_ST[s.status] || [s.status, 'b-nodata'];
     const last = s.last_scan_at ? (d.now*1000 - Date.parse((s.last_scan_at+'Z').replace(' ','T'))) : null;
     return `<div class="card" style="margin:8px 0;padding:10px 12px">
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
@@ -1033,20 +1246,154 @@ async function loadAdmin(){
         <span>🕓 ${last ? 'скан ' + ago(Math.round(last/1000), d.now) : 'ещё не сканился'}</span>
       </div>
       <div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap">
+        <button class="btn ghost sm" onclick="admOpenItems(${s.id})">📦 Товары</button>
         ${s.status==='ACTIVE'?'':`<button class="btn ghost sm" onclick="adminAct(${s.id},'resume')">▶ Старт</button>`}
         ${s.status==='ACTIVE'?`<button class="btn ghost sm" onclick="adminAct(${s.id},'pause')">⏸ Пауза</button>`:''}
         ${s.status!=='STOPPED'?`<button class="btn ghost sm" onclick="adminAct(${s.id},'stop')">⏹ Стоп</button>`:''}
-        <button class="btn ghost sm" style="color:var(--bad)" onclick="adminAct(${s.id},'delete')">🗑 Удалить</button>
+        <button class="btn ghost sm" onclick="admMsg(${s.chat_id})">💬 Сообщение</button>
+        <button class="btn ghost sm" style="color:var(--bad)" onclick="adminAct(${s.id},'delete')">🗑</button>
       </div>
     </div>`;
-  }).join('') || '<p class="muted">Поисков нет</p>';
-  document.getElementById('adr-searches').innerHTML =
-    `<h3>📋 Все поиски пользователей</h3>${ss}`;
+  }).join('') || '<div class="card"><p class="muted">Поисков нет</p></div>';
+  document.getElementById('adm-searches').innerHTML =
+    `<div class="card"><h3>📋 Все поиски пользователей</h3>${ss}</div>`;
+}
+function rQueue(d){
+  const q = (d.queue||[]).map(x=>
+    `<div class="adm-row">
+      <span class="badge b-${x.status==='DONE'?'match':(x.status==='PROCESSING'?'rec':'nodata')}">${x.status}</span>
+      <b style="font-size:13px">${esc((x.title||'').slice(0,42))}</b>
+      <span class="muted">${rub(x.price)}</span>
+      <span class="muted" style="margin-left:auto">поиск №${x.search_id} · ${ago(x.requested_at, d.now)}</span>
+    </div>`).join('') || '<p class="muted">Очередь пуста</p>';
+  document.getElementById('adr-queue').innerHTML =
+    `<h3>🃏 Очередь карточек</h3>${q}
+     <div style="margin-top:8px"><button class="btn ghost sm" onclick="admQueueClear()">♻️ Вернуть застрявшие в очередь</button></div>`;
+}
+function rAvito(d){
+  const ev = (d.events||[]).map(e=>{
+    const ic = e.kind==='scan'?'🔄':(e.kind==='scan_throttle'?'⛔':(e.kind==='card'?'🃏':(e.kind==='admin'?'🛠':'⚖️')));
+    return `<div class="adm-row" style="padding:5px 0;font-size:12.5px">
+      <span class="muted">${fmtTs(e.ts)}</span><span>${ic}</span>
+      <span>${esc(e.detail)}</span>
+      ${e.dur?`<span class="muted" style="margin-left:auto">${fmtDur(e.dur)}</span>`:''}
+    </div>`;}).join('') || '<p class="muted">Пока тишина</p>';
+  document.getElementById('adr-events').innerHTML =
+    `<h3>⏱ Запросы к Авито</h3>${ev}`;
+}
+const AI_TAG_RU = {plan:'🧠 план поиска', merge:'📝 уточнение', feedback:'💬 фидбэк',
+                   screen:'🔍 отсеивание', verify:'⚖️ сверка', compare:'🏆 сравнение'};
+function rAI(d){
+  const rows = (d.ai_log||[]).map(e=>
+    `<details class="adm-d">
+      <summary>${fmtTs(e.ts)} · ${AI_TAG_RU[e.tag]||e.tag} · ${fmtDur(e.dur)||'—'}${e.err?' · ⚠️ '+esc(e.err):''}</summary>
+      <div class="muted" style="margin-top:6px">Запрос:</div>
+      <div class="adm-pre">${esc(e.prompt)}</div>
+      <div class="muted" style="margin-top:6px">Ответ:</div>
+      <div class="adm-pre">${esc(e.response || '(пусто)')}</div>
+    </details>`).join('') || '<p class="muted">Нейросеть ещё не вызывалась</p>';
+  document.getElementById('adr-ai').innerHTML =
+    `<h3>🧠 Запросы и ответы нейросети</h3>${rows}`;
+}
+function rSettings(d){
+  const c = d.cfg;
+  document.getElementById('adr-settings').innerHTML =
+    `<h3>⚙️ Настройки бота</h3>
+     <div class="adm-row"><span>⏱ Интервал скана, сек</span><input class="adm-in" id="cfg-interval" type="number" min="30" value="${c.interval}" style="margin-left:auto"></div>
+     <div class="adm-row"><span>🔄 Запросов за цикл</span><input class="adm-in" id="cfg-req" type="number" min="1" max="10" value="${c.requests_per_cycle}" style="margin-left:auto"></div>
+     <div class="adm-row"><span>🃏 Кулдаун карточек, сек</span><input class="adm-in" id="cfg-cd" type="number" min="30" value="${c.card_cooldown}" style="margin-left:auto"></div>
+     <div class="adm-row"><span>🛑 Стоп если подошло ≥ лотов (0 — выкл.)</span><input class="adm-in" id="cfg-am" type="number" min="0" value="${c.auto_stop_matched}" style="margin-left:auto"></div>
+     <div class="adm-row"><span>⏰ Стоп если работает ≥ часов (0 — выкл.)</span><input class="adm-in" id="cfg-ah" type="number" min="0" value="${c.auto_stop_hours}" style="margin-left:auto"></div>
+     <div style="margin-top:10px"><button class="btn primary" onclick="admSaveCfg()">💾 Сохранить</button></div>
+     <p class="muted" style="font-size:11px;margin-top:8px">Лимиты применяются при каждом скане: поиск автоматически остановится и пользователю придёт уведомление.</p>`;
+}
+async function admSaveCfg(){
+  const body = {
+    interval: document.getElementById('cfg-interval').value,
+    requests_per_cycle: document.getElementById('cfg-req').value,
+    card_cooldown: document.getElementById('cfg-cd').value,
+    auto_stop_matched: document.getElementById('cfg-am').value,
+    auto_stop_hours: document.getElementById('cfg-ah').value,
+  };
+  const r = await api('/api/admin/config', body);
+  if (r.ok) toast('✅ Сохранил: ' + (r.changed||[]).join(', ')); else toast(r.error || 'Ошибка', true);
+  loadAdmin();
+}
+function admQueueClear(){
+  api('/api/admin/queue/clear', {}).then(r=>{ if (r.ok) { toast('✅ Готово'); loadAdmin(); } });
 }
 async function adminAct(sid, act){
   if (act === 'delete' && !confirm('Удалить поиск №' + sid + ' со всеми лотами?')) return;
-  const r = await api(`/api/admin/search/${sid}/${act}`, {});
-  if (r.ok) { toast('✅ Готово'); loadAdmin(); } else toast(r.error || 'Ошибка', true);
+  let msg = '';
+  if (['stop','pause','delete'].includes(act)) {
+    msg = prompt('Уведомить пользователя (сообщение, можно пусто):', '') ?? '';
+  }
+  const r = await api(`/api/admin/search/${sid}/${act}`, {message: msg});
+  if (r.ok) { toast('✅ Готово' + (msg ? ' — уведомление отправлено' : '')); loadAdmin(); } else toast(r.error || 'Ошибка', true);
+}
+async function admMsg(chatId){
+  const text = prompt('Сообщение пользователю ' + chatId + ':', '');
+  if (!text) return;
+  const r = await api('/api/admin/message', {chat_id: chatId, text});
+  if (r.ok) toast('✅ Отправил'); else toast(r.error || 'Ошибка', true);
+}
+// --- товары пользователей ---
+async function admOpenItems(sid){
+  admSearchId = sid;
+  admTab('items');
+}
+async function admLoadSearchChips(){
+  if (!ADMIN) { try { ADMIN = await api('/api/admin'); } catch(e){ return; } }
+  const chips = (ADMIN.searches||[]).map(s=>
+    `<button class="chip ${admSearchId===s.id?'on':''}" onclick="admSearchId=${s.id};admLoadSearchChips();admLoadItems()">№${s.id} ${esc((s.title||'').slice(0,18))}</button>`).join('');
+  document.getElementById('adm-item-chips').innerHTML = chips;
+  admLoadItems();
+}
+async function admLoadItems(){
+  const box = document.getElementById('adm-item-list');
+  if (!admSearchId){ box.innerHTML = '<div class="card"><p class="muted">Выбери поиск сверху</p></div>'; return; }
+  let d;
+  try { d = await api(`/api/admin/search/${admSearchId}/items`); } catch(e){ return; }
+  const rows = (d.items||[]).map(i=>{
+    const vb = i.verdict === 'MATCH' ? '<span class="badge b-match">✅ совпадение</span>'
+      : i.verdict === 'CLOSE' ? '<span class="badge b-close">🟡 возможно</span>'
+      : i.verdict === 'REJECT' ? '<span class="badge b-reject">не подходит</span>' : '';
+    return `<div class="card" style="margin:8px 0;padding:10px 12px">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        ${vb}<span style="font-weight:650">${esc((i.title||'').slice(0,48))}</span>
+        <span class="muted">${rub(i.price)}</span>
+        <span class="muted" style="margin-left:auto">${i.notified?'📨 уведомлён':''}</span>
+      </div>
+      ${i.reason?`<div class="muted" style="margin-top:4px;font-size:12px">🧐 ${esc(i.reason)}</div>`:''}
+      <div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap">
+        ${i.has_card?`<button class="btn ghost sm" onclick="admOpenCard('${admSearchId}','${i.avito_id}',this)">🃏 Карточка</button>`:''}
+        ${i.url?`<a class="btn ghost sm" href="${esc(i.url)}" target="_blank">🔗 Авито</a>`:''}
+      </div>
+      <div class="adm-card-box"></div>
+    </div>`;
+  }).join('') || '<div class="card"><p class="muted">Лотов пока нет</p></div>';
+  box.innerHTML = rows;
+}
+async function admOpenCard(sid, iid, btn){
+  const box = btn.closest('.card').querySelector('.adm-card-box');
+  if (box.dataset.open === iid){ box.innerHTML=''; box.dataset.open=''; return; }
+  box.dataset.open = iid;
+  btn.textContent = '⏳';
+  let d;
+  try { d = await api(`/api/admin/item/${sid}/${iid}`); } catch(e){ btn.textContent='🃏'; return; }
+  btn.textContent = '🃏';
+  const card = d.card || {};
+  const aj = d.ai_json || {};
+  const params = (card.params||[]).map(p=>`<li>${esc(p)}</li>`).join('');
+  const photos = (card.photos||[]).slice(0,4).map(u=>`<img src="${esc(u)}" loading="lazy" style="width:88px;height:88px;object-fit:cover;border-radius:10px;border:1px solid var(--line)">`).join('');
+  box.innerHTML = `<details class="adm-d" open>
+    <summary>🃏 Карточка ${esc(iid)}</summary>
+    ${photos?`<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">${photos}</div>`:''}
+    ${card.description?`<div class="muted" style="margin-top:8px">Описание:</div><div class="adm-pre">${esc(card.description)}</div>`:''}
+    ${params?`<div class="muted" style="margin-top:8px">Характеристики:</div><ul class="param-list">${params}</ul>`:''}
+    ${d.reason?`<div class="muted" style="margin-top:8px">🧐 Нейросеть: ${esc(d.reason)}</div>`:''}
+    ${Object.keys(aj).length?`<details class="adm-d" style="margin-top:8px"><summary>Сырой вердикт ИИ (JSON)</summary><div class="adm-pre">${esc(JSON.stringify(aj, null, 2))}</div></details>`:''}
+  </details>`;
 }
 function toggleFromModal(sid, iid){
   toggleCmp(sid, iid);
@@ -1369,6 +1716,10 @@ def build_app() -> web.Application:
     app.router.add_get("/api/admin", api_admin)
     app.router.add_post("/api/admin/search/{sid}/{action}", api_admin_search_action)
     app.router.add_post("/api/admin/queue/clear", api_admin_queue_clear)
+    app.router.add_post("/api/admin/message", api_admin_message)
+    app.router.add_post("/api/admin/config", api_admin_config)
+    app.router.add_get("/api/admin/search/{sid}/items", api_admin_search_items)
+    app.router.add_get("/api/admin/item/{sid}/{iid}", api_admin_item_card)
     return app
 
 

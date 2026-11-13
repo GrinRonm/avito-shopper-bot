@@ -409,6 +409,16 @@ def list_items_web(mode: str = "all", chat_id: int = None, search_id: int = None
     return out
 
 
+def count_matched(sid: int) -> int:
+    """Сколько лотов поиска уже уведомлено как подходящие."""
+    conn = _conn()
+    n = conn.execute(
+        "SELECT COUNT(*) FROM items WHERE search_id = ? AND notified = 1 AND hidden = 0",
+        (sid,)).fetchone()[0]
+    conn.close()
+    return n
+
+
 def list_searches_web(chat_id: int = None) -> list:
     conds, vals = [], []
     if chat_id is not None:

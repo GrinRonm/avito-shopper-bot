@@ -105,6 +105,11 @@ async def _beatapi(prompt: str, tag: str) -> str:
             log.info(f"⏳ Кулдаун нейросети: {int(wait)} сек ({tag})")
             await asyncio.sleep(wait)
 
+        try:
+            import webapp
+            webapp.ai_log(tag, prompt, "", err="⏳ кулдаун " + str(int(wait)) + "с")
+        except Exception:
+            pass
         payload = {
             "model": BEATAPI_MODEL,
             "input": [{"role": "user", "content": prompt}],
@@ -119,6 +124,7 @@ async def _beatapi(prompt: str, tag: str) -> str:
             with urllib.request.urlopen(req, timeout=120) as resp:
                 return resp.read()
 
+        _t0 = time.time()
         for attempt in range(3):
             try:
                 raw = await asyncio.to_thread(_do)
@@ -128,19 +134,45 @@ async def _beatapi(prompt: str, tag: str) -> str:
                     if item.get("type") == "message":
                         for block in item.get("content", []):
                             if block.get("type") == "output_text":
-                                return block.get("text", "")
+                                text = block.get("text", "")
+                                try:
+                                    import webapp
+                                    webapp.ai_log(tag, prompt, text, dur=time.time() - _t0)
+                                except Exception:
+                                    pass
+                                return text
+                try:
+                    import webapp
+                    webapp.ai_log(tag, prompt, "", dur=time.time() - _t0, err="пустой ответ")
+                except Exception:
+                    pass
                 return ""
             except urllib.error.HTTPError as he:
                 _last_call = time.time()
                 if he.code == 429:
                     log.info("⚠️ 429 от BeatAPI, жду 65 сек...")
+                    try:
+                        import webapp
+                        webapp.ai_log(tag, prompt, "", err="429, жду 65с")
+                    except Exception:
+                        pass
                     await asyncio.sleep(65)
                     continue
+                try:
+                    import webapp
+                    webapp.ai_log(tag, prompt, "", err=f"HTTP {he.code}")
+                except Exception:
+                    pass
                 raise
             except Exception as e:
                 if attempt < 2:
                     await asyncio.sleep(5)
                     continue
+                try:
+                    import webapp
+                    webapp.ai_log(tag, prompt, "", err=str(e)[:200])
+                except Exception:
+                    pass
                 raise
     return ""
 

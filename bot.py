@@ -753,6 +753,51 @@ async def send_match_notification(bot: Bot, pack: dict, verdict: dict):
 
 # ============================================================ main
 
+# ============================================================ авто-лимиты
+
+async def _enforce_auto_limits(bot: Bot):
+    """Авто-остановка поисков по лимитам из config.json (меняются в админке):
+    auto_stop_matched — максимум «подошло» лотов; auto_stop_hours — часов работы."""
+    max_matched = int(appconfig.cfg("auto_stop_matched", 0) or 0)
+    max_hours = float(appconfig.cfg("auto_stop_hours", 0) or 0)
+    if max_matched <= 0 and max_hours <= 0:
+        return
+    from datetime import datetime
+    for sid in db.list_active_searches():
+        srow = db.get_search(sid)
+        if not srow or srow["status"] != "ACTIVE":
+            continue
+        reason = ""
+        if max_matched > 0:
+            n = db.count_matched(sid)
+            if n >= max_matched:
+                reason = f"подошло {n} лотов (лимит {max_matched})"
+        if not reason and max_hours > 0 and srow["created_at"]:
+            try:
+                created = datetime.fromisoformat(str(srow["created_at"]))
+                hours = (datetime.utcnow() - created).total_seconds() / 3600
+                if hours >= max_hours:
+                    reason = f"поиск работает {int(hours)} ч (лимит {max_hours} ч)"
+            except Exception:
+                pass
+        if not reason:
+            continue
+        db.set_search_status(sid, "STOPPED")
+        log.info("🛠 Авто-стоп поиска №%s: %s", sid, reason)
+        try:
+            await bot.send_message(
+                srow["chat_id"],
+                f"🛠 Поиск №{sid} «{esc(srow['title'] or '')}» <b>автоматически остановлен</b>:\n"
+                f"{esc(reason)}.\n\nЕсли хочешь продолжить — просто напиши, что искать 🙂")
+        except Exception:
+            log.exception("авто-стоп: не отправилось уведомление")
+        try:
+            import webapp
+            webapp.metric("admin", f"авто-стоп №{sid}: {reason}")
+        except Exception:
+            pass
+
+
 async def scan_loop(bot: Bot):
     interval = appconfig.cfg("check_interval_seconds", 120)
     while True:
@@ -762,6 +807,7 @@ async def scan_loop(bot: Bot):
             except asyncio.TimeoutError:
                 pass
             _wake.clear()
+            await _enforce_auto_limits(bot)
             await run_scan(bot)
             if avito.pop_throttled():
                 # Avito режет IP: не дёргаем его по расписанию, ставим паузу побольше,
@@ -791,6 +837,11 @@ async def main():
     db.init_db()
     bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     globals()["BOT"] = bot          # webapp.py шлёт заявки через BOT
+    try:
+        import webapp
+        webapp.BOT = bot            # прямая ссылка для уведомлений из админки
+    except Exception:
+        pass
     dp = Dispatcher()
     dp.include_router(router)
 

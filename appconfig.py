@@ -12,3 +12,15 @@ def cfg(key: str, default=None):
         return data.get(key, default)
     except Exception:
         return default
+
+
+def set_cfg(key: str, value):
+    """Записать один ключ в config.json (используется админкой)."""
+    try:
+        with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    data[key] = value
+    with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
